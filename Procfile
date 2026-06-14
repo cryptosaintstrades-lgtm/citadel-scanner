@@ -1,1 +1,1 @@
-worker: python citadel_scanner_v32_5_full_quality_breakdown.py
+worker: python citadel_scanner_v32_6_forced_quality_display.py
