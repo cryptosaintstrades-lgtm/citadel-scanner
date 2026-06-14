@@ -1,1 +1,1 @@
-worker: python citadel_scanner_v32_6_forced_quality_display.py
+worker: python citadel_scanner_v32_7_discord_alert_fix.py
