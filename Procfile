@@ -1,1 +1,1 @@
-worker: python citadel_scanner_v32_quality_engine.py
+worker: python citadel_scanner_v32_1_quality_cleanup.py
