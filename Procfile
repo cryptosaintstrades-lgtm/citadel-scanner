@@ -1,1 +1,1 @@
-worker: python citadel_scanner_v29_leaderboard.py
+worker: python citadel_scanner_v31_htf_daily_report.py
