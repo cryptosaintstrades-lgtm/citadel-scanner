@@ -1,0 +1,1 @@
+worker: python citadel_scanner_v29_leaderboard.py
