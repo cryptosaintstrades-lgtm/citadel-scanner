@@ -1,1 +1,1 @@
-worker: python citadel_scanner_v31_htf_daily_report.py
+worker: python citadel_scanner_v32_quality_engine.py
