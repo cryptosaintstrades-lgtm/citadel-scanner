@@ -1,1 +1,1 @@
-worker: python citadel_scanner_v32_4_clean_htf_discord.py
+worker: python citadel_scanner_v32_5_full_quality_breakdown.py
