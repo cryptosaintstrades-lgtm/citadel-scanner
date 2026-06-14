@@ -4,7 +4,11 @@ import csv
 import os
 import json
 from datetime import datetime, timedelta
-
+print("")
+print("################################################")
+print("### v32.3 QUALITY + HTF VERIFIED LOADED ########")
+print("################################################")
+print("")
 BLOFIN_TICKERS_URL = "https://openapi.blofin.com/api/v1/market/tickers"
 BLOFIN_CANDLES_URL = "https://openapi.blofin.com/api/v1/market/candles"
 
