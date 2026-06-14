@@ -1,1 +1,1 @@
-worker: python citadel_scanner_v32_2_quality_htf_visible.py
+worker: python citadel_scanner_v32_3_quality_htf_verified.py
