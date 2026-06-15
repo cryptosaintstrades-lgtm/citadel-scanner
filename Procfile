@@ -1,1 +1,1 @@
-worker: python citadel_scanner_v32_7_discord_alert_fix.py
+worker: python citadel_scanner_v32_8_stop_safety_patch.py
