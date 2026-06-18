@@ -12,7 +12,7 @@ BLOFIN_CANDLES_URL = "https://openapi.blofin.com/api/v1/market/candles"
 # Paste your webhook between the quotes below.
 # Railway use later:
 # Add DISCORD_WEBHOOK_URL as an environment variable and Railway will override this.
-DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1515481202365038632/p3V0Se4CAdGYmEJ0wOld5rM-oHlsdg8P1TPvRhxiWm9qS95OYLiQ3U1JnYvsJlzy5ctH"
+DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/1515481202365038632/p3V0Se4CAdGYmEJ0wOld5rM-oHlsdg8P1TPvRhxiWm9qS95OYLiQ3U1JnYvsJlzy5ctH")
 
 SCAN_EVERY_SECONDS = 300
 LOG_FILE = "scanner_log.csv"
@@ -20,6 +20,18 @@ ALERTS_FILE = "alerts.json"
 ACTIVE_TRADES_FILE = "active_trades.json"
 TRADE_HISTORY_FILE = "trade_history.csv"
 SCANNER_STATS_FILE = "scanner_stats.json"
+
+# v33 Airtable website feed settings
+# Railway variables recommended:
+# AIRTABLE_TOKEN = pat...
+# AIRTABLE_BASE_ID = appSwudFWMM3ETD68
+# AIRTABLE_SCANNER_TABLE = Scanner Alerts
+# PUSH_SCANNER_ALERTS_TO_AIRTABLE = true
+AIRTABLE_TOKEN = os.environ.get("AIRTABLE_TOKEN", "")
+AIRTABLE_BASE_ID = os.environ.get("AIRTABLE_BASE_ID", "appSwudFWMM3ETD68")
+AIRTABLE_SCANNER_TABLE = os.environ.get("AIRTABLE_SCANNER_TABLE", "Scanner Alerts")
+PUSH_SCANNER_ALERTS_TO_AIRTABLE = os.environ.get("PUSH_SCANNER_ALERTS_TO_AIRTABLE", "false").lower() == "true"
+
 
 
 MIN_24H_MOVE_FOR_CANDLES = 5
@@ -1969,6 +1981,100 @@ def update_active_trades(tickers):
     elif POST_STATS_AFTER_TP1 and tp1_updates > 0:
         send_performance_stats_discord("TP1 HIT")
 
+
+def airtable_enabled():
+    return bool(AIRTABLE_TOKEN and AIRTABLE_BASE_ID and AIRTABLE_SCANNER_TABLE and PUSH_SCANNER_ALERTS_TO_AIRTABLE)
+
+
+def airtable_headers():
+    return {
+        "Authorization": f"Bearer {AIRTABLE_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+
+def airtable_table_url():
+    table = AIRTABLE_SCANNER_TABLE.replace(" ", "%20")
+    return f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{table}"
+
+
+def scanner_alert_summary(coin):
+    active = get_coin_active_side(coin)
+    tier = get_alert_tier(coin)
+    reasons = coin.get("setup_reasons", "")
+    reason_bits = [r.strip() for r in reasons.split(" | ") if r.strip()]
+    short_reasons = " • ".join(reason_bits[:3]) if reason_bits else "Scanner-qualified setup. Manual chart confirmation required."
+    return (
+        f"{tier} | {coin.get('symbol', '')} {coin.get('trade_bias', '')} | "
+        f"Grade {active.get('grade', '')} | Score {active.get('score', 0)} | "
+        f"Entry readiness {active.get('entry', 0)} | R:R {coin.get('rr', '')}. "
+        f"{short_reasons}"
+    )
+
+
+def push_scanner_alert_to_airtable(coin):
+    """Pushes scanner alert into Airtable so the website can show latest alerts."""
+    if not airtable_enabled():
+        return False
+
+    try:
+        coin = ensure_quality_fields(coin)
+        active = get_coin_active_side(coin)
+        tier = get_alert_tier(coin)
+
+        entry_zone = ""
+        if coin.get("entry_low") != "" and coin.get("entry_high") != "":
+            entry_zone = f"{coin.get('entry_low')} - {coin.get('entry_high')}"
+
+        targets = ""
+        if coin.get("target1") != "" or coin.get("target2") != "":
+            targets = f"TP1: {coin.get('target1')} | TP2: {coin.get('target2')}"
+
+        fields = {
+            "Pair": coin.get("symbol", ""),
+            "Direction": coin.get("trade_bias", active.get("side", "")),
+            "Grade": active.get("grade", ""),
+            "Score": active.get("score", 0),
+            "Summary": scanner_alert_summary(coin),
+            "Entry Zone": entry_zone,
+            "Invalidation": str(coin.get("stop", "")),
+            "Targets": targets,
+            "Timeframe": "5m / 15m / 1H / 4H",
+            "Date": datetime.utcnow().isoformat(),
+            "Published": True,
+            "Featured": True,
+        }
+
+        # Optional fields: only sent if your Airtable table has matching columns.
+        optional_fields = {
+            "Alert Type": tier,
+            "Entry Readiness": active.get("entry", 0),
+            "R:R": str(coin.get("rr", "")),
+            "TradingView": coin.get("tradingview", ""),
+            "Quality": coin.get("quality_total", 0),
+            "Structure": coin.get("quality_structure", 0),
+            "HTF": coin.get("quality_htf", 0),
+            "Volume": coin.get("quality_volume", 0),
+            "Location": coin.get("quality_location", 0),
+            "Liquidity": coin.get("quality_liquidity", 0),
+        }
+
+        payload = {"records": [{"fields": fields}]}
+        r = requests.post(airtable_table_url(), headers=airtable_headers(), json=payload, timeout=10)
+
+        # If optional fields exist in Airtable later, a second version can include them.
+        if r.status_code in [200, 201]:
+            print(f"Airtable scanner alert pushed: {coin.get('symbol')} {coin.get('trade_bias')} {tier}")
+            return True
+
+        print(f"Airtable push failed: {r.status_code} {r.text}")
+        return False
+
+    except Exception as e:
+        print(f"Airtable push error: {e}")
+        return False
+
+
 def send_discord_alert(coin):
     if not DISCORD_WEBHOOK_URL:
         return
@@ -1989,6 +2095,7 @@ def send_discord_alert(coin):
 
         if r.status_code in [200, 204]:
             print(f"Discord alert sent: {coin['symbol']} {coin['trade_bias']} {tier}")
+            push_scanner_alert_to_airtable(coin)
             mark_alert_sent(coin)
             register_active_trade(coin)
         else:
@@ -2471,7 +2578,7 @@ def send_daily_report_discord():
 
 def run_scanner():
     print("\n" + "=" * 190)
-    print("CITADEL TRADE OPPORTUNITY SCANNER v32.8 — STOP SAFETY + CLEAN HTF ENGINE")
+    print("CITADEL TRADE OPPORTUNITY SCANNER v33 — AIRTABLE PUSH + STOP SAFETY")
     print(f"Scan Time: {datetime.now()}")
     print("=" * 190)
 
@@ -2514,7 +2621,7 @@ def run_scanner():
     print("\n" + "-" * 190)
     print(f"Saved {len(results)} rows to {LOG_FILE}")
     print(f"Checked 5m + 15m candles for top {MAX_CANDLE_CHECKS} movers only.")
-    print("Reminder: v32.8 forces invalidation outside entry zone + keeps clean HTF quality display.")
+    print("Reminder: v33 pushes qualified Discord alerts to Airtable when enabled.")
 
 
 if __name__ == "__main__":
