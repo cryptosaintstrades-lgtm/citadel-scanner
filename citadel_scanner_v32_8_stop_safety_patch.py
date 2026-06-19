@@ -12,7 +12,7 @@ BLOFIN_CANDLES_URL = "https://openapi.blofin.com/api/v1/market/candles"
 # Paste your webhook between the quotes below.
 # Railway use later:
 # Add DISCORD_WEBHOOK_URL as an environment variable and Railway will override this.
-DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/1515481202365038632/p3V0Se4CAdGYmEJ0wOld5rM-oHlsdg8P1TPvRhxiWm9qS95OYLiQ3U1JnYvsJlzy5ctH")
+DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/1517639929168138430/_CUqmvSPvB-Bw_6ap1kSaDkkZXQaHkmJr-DkYdBkBqbFljohAJnlv1A_QwWkJu1v3K6b")
 
 SCAN_EVERY_SECONDS = 300
 LOG_FILE = "scanner_log.csv"
