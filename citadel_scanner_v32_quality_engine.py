@@ -12,7 +12,7 @@ BLOFIN_CANDLES_URL = "https://openapi.blofin.com/api/v1/market/candles"
 # Paste your webhook between the quotes below.
 # Railway use later:
 # Add DISCORD_WEBHOOK_URL as an environment variable and Railway will override this.
-DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1515481202365038632/p3V0Se4CAdGYmEJ0wOld5rM-oHlsdg8P1TPvRhxiWm9qS95OYLiQ3U1JnYvsJlzy5ctH"
+DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/1515481202365038632/p3V0Se4CAdGYmEJ0wOld5rM-oHlsdg8P1TPvRhxiWm9qS95OYLiQ3U1JnYvsJlzy5ctH")
 
 SCAN_EVERY_SECONDS = 300
 LOG_FILE = "scanner_log.csv"
@@ -20,6 +20,28 @@ ALERTS_FILE = "alerts.json"
 ACTIVE_TRADES_FILE = "active_trades.json"
 TRADE_HISTORY_FILE = "trade_history.csv"
 SCANNER_STATS_FILE = "scanner_stats.json"
+
+# v33 Airtable website feed settings
+# Railway variables recommended:
+# AIRTABLE_TOKEN = pat...
+# AIRTABLE_BASE_ID = appSwudFWMM3ETD68
+# AIRTABLE_SCANNER_TABLE = Scanner Alerts
+# PUSH_SCANNER_ALERTS_TO_AIRTABLE = true
+AIRTABLE_TOKEN = os.environ.get("AIRTABLE_TOKEN", "")
+AIRTABLE_BASE_ID = os.environ.get("AIRTABLE_BASE_ID", "appSwudFWMM3ETD68")
+AIRTABLE_SCANNER_TABLE = os.environ.get("AIRTABLE_SCANNER_TABLE", "Scanner Alerts")
+PUSH_SCANNER_ALERTS_TO_AIRTABLE = os.environ.get("PUSH_SCANNER_ALERTS_TO_AIRTABLE", "false").lower() == "true"
+
+# v34 / v64 Netlify snapshot integration
+# Website v63 provides /.netlify/functions/save-scanner-snapshot.
+# The scanner sends candle data there, Netlify Blobs stores a branded SVG,
+# then this bot writes the returned URL into Airtable's Screenshot URL field.
+NETLIFY_SITE_URL = os.environ.get("NETLIFY_SITE_URL", "https://theliquiditycitadel.trade").rstrip("/")
+ENABLE_NETLIFY_SNAPSHOTS = os.environ.get("ENABLE_NETLIFY_SNAPSHOTS", "true").lower() == "true"
+NETLIFY_SNAPSHOT_SECRET = os.environ.get("NETLIFY_SNAPSHOT_SECRET", os.environ.get("SNAPSHOT_INGEST_SECRET", ""))
+SNAPSHOT_TIMEFRAME = os.environ.get("SNAPSHOT_TIMEFRAME", "5m")
+SNAPSHOT_CANDLE_LIMIT = int(os.environ.get("SNAPSHOT_CANDLE_LIMIT", "80"))
+AIRTABLE_SCREENSHOT_FIELD = os.environ.get("AIRTABLE_SCREENSHOT_FIELD", "Screenshot URL")
 
 
 MIN_24H_MOVE_FOR_CANDLES = 5
@@ -31,9 +53,14 @@ B_SCORE = 65
 
 ENTRY_READY_SCORE = 70
 
-DISCORD_ENTRY_THRESHOLD = 95
+DISCORD_ENTRY_THRESHOLD = 70
 DISCORD_MIN_RR = 2.0
 MAX_DISCORD_ALERTS_PER_SCAN = 3
+
+# v32.8 Stop Safety Patch: force invalidation outside entry zone.
+# This prevents valid HTF/quality setups from being blocked only because the legacy grade is low.
+DISCORD_MIN_QUALITY = 60
+DISCORD_REQUIRE_HTF_ALIGNMENT = 1
 
 # Optional role ping:
 # To ping a Discord role, right-click the role, copy role ID, and paste it like: "<@&123456789012345678>"
@@ -49,6 +76,11 @@ ALERT_BRAND_NAME = "🏰 LIQUIDITY CITADEL ELITE SCANNER"
 # Elite filter:
 # Only Discord-alert A+ setups with strong entry readiness and 5m/15m structure agreement.
 ELITE_ONLY = True
+# v32.4 balanced HTF alert filter:
+# Elite Discord alerts require at least 1 of 2 HTF confirmations.
+# S-Tier still requires 1H and can optionally require 4H via S_TIER_REQUIRES_4H.
+ELITE_MIN_HTF_ALIGNMENT = 1
+
 
 COOLDOWN_MINUTES = 30
 SCORE_IMPROVEMENT_REQUIRED = 10
@@ -79,15 +111,6 @@ S_TIER_REQUIRES_4H = False
 DAILY_REPORT_FILE = "daily_report_state.json"
 POST_DAILY_REPORT_TO_DISCORD = True
 DAILY_REPORT_HOUR_UTC = 0
-
-# v32 institutional quality score settings
-ENABLE_QUALITY_SCORE_ENGINE = True
-QUALITY_ALERT_THRESHOLD = 90
-S_TIER_QUALITY_THRESHOLD = 95
-A_PLUS_QUALITY_THRESHOLD = 90
-A_QUALITY_THRESHOLD = 80
-B_QUALITY_THRESHOLD = 70
-REQUIRE_QUALITY_FOR_DISCORD = True
 
 
 def safe_float(value):
@@ -171,6 +194,14 @@ def build_short_trade_plan(candles):
     entry_low = current_price
     entry_high = current_price * 1.01
     stop = swing_high * 1.002
+
+    # v32.8 safety: SHORT invalidation must always be ABOVE the entry zone.
+    # If the swing stop lands inside/below the zone, push it outside the zone.
+    min_stop = entry_high * 1.005
+    stop_was_adjusted = stop <= entry_high
+    if stop_was_adjusted:
+        stop = min_stop
+
     risk = stop - current_price
 
     if risk <= 0:
@@ -188,6 +219,7 @@ def build_short_trade_plan(candles):
         "target1": round(target1, 8),
         "target2": round(target2, 8),
         "rr": rr,
+        "stop_safety_adjusted": stop_was_adjusted,
     }
 
 
@@ -204,6 +236,14 @@ def build_long_trade_plan(candles):
     entry_low = current_price * 0.99
     entry_high = current_price
     stop = swing_low * 0.998
+
+    # v32.8 safety: LONG invalidation must always be BELOW the entry zone.
+    # If the swing stop lands inside/above the zone, push it outside the zone.
+    max_stop = entry_low * 0.995
+    stop_was_adjusted = stop >= entry_low
+    if stop_was_adjusted:
+        stop = max_stop
+
     risk = current_price - stop
 
     if risk <= 0:
@@ -221,6 +261,7 @@ def build_long_trade_plan(candles):
         "target1": round(target1, 8),
         "target2": round(target2, 8),
         "rr": rr,
+        "stop_safety_adjusted": stop_was_adjusted,
     }
 
 
@@ -704,6 +745,208 @@ def htf_alignment_count(coin):
     return count
 
 
+def quality_breakdown(coin):
+    """Institutional-style quality score with visible HTF diagnostics."""
+    side = coin.get("trade_bias", "")
+    structure = 0
+    htf = 0
+    volume = 0
+    location = 0
+    liquidity = 0
+
+    # Structure: 5m + 15m confirmation
+    if side == "SHORT":
+        if coin.get("structure_note_5m") in ["Bearish CHOCH", "Bearish BOS"]:
+            structure += 10
+        if coin.get("structure_note_15m") in ["Bearish CHOCH", "Bearish BOS"]:
+            structure += 10
+
+        if coin.get("structure_note_1h") in ["Bearish CHOCH", "Bearish BOS"]:
+            htf += 10
+        if coin.get("structure_note_4h") in ["Bearish CHOCH", "Bearish BOS"]:
+            htf += 10
+
+        if coin.get("range_pos", 50) >= 90:
+            location += 12
+        elif coin.get("range_pos", 50) >= 80:
+            location += 8
+        if coin.get("pullback_from_high", 0) >= 3:
+            location += 8
+
+        if coin.get("sweep_high_5m"):
+            liquidity += 14
+        if coin.get("lower_high_5m"):
+            liquidity += 6
+
+    elif side == "LONG":
+        if coin.get("structure_note_5m") in ["Bullish CHOCH", "Bullish BOS"]:
+            structure += 10
+        if coin.get("structure_note_15m") in ["Bullish CHOCH", "Bullish BOS"]:
+            structure += 10
+
+        if coin.get("structure_note_1h") in ["Bullish CHOCH", "Bullish BOS"]:
+            htf += 10
+        if coin.get("structure_note_4h") in ["Bullish CHOCH", "Bullish BOS"]:
+            htf += 10
+
+        if coin.get("range_pos", 50) <= 10:
+            location += 12
+        elif coin.get("range_pos", 50) <= 20:
+            location += 8
+        if coin.get("bounce_from_low", 0) >= 3:
+            location += 8
+
+        if coin.get("sweep_low_5m"):
+            liquidity += 14
+        if coin.get("higher_low_5m"):
+            liquidity += 6
+
+    # Volume quality from 5m and 15m spike
+    spike_5m = safe_float(coin.get("volume_spike_5m"))
+    spike_15m = safe_float(coin.get("volume_spike_15m"))
+
+    if spike_5m >= 5:
+        volume += 10
+    elif spike_5m >= 3:
+        volume += 8
+    elif spike_5m >= 2:
+        volume += 6
+    elif spike_5m >= 1.25:
+        volume += 3
+
+    if spike_15m >= 4:
+        volume += 10
+    elif spike_15m >= 2.5:
+        volume += 8
+    elif spike_15m >= 1.5:
+        volume += 6
+    elif spike_15m >= 1.25:
+        volume += 3
+
+    structure = min(structure, 20)
+    htf = min(htf, 20)
+    volume = min(volume, 20)
+    location = min(location, 20)
+    liquidity = min(liquidity, 20)
+    total = structure + htf + volume + location + liquidity
+
+    return {
+        "quality_structure": structure,
+        "quality_htf": htf,
+        "quality_volume": volume,
+        "quality_location": location,
+        "quality_liquidity": liquidity,
+        "quality_total": total,
+        "htf_alignment": htf_alignment_count(coin),
+        "htf_1h_aligned": htf_structure_agrees(coin, "1h"),
+        "htf_4h_aligned": htf_structure_agrees(coin, "4h"),
+    }
+
+
+def quality_grade(total):
+    if total >= 95:
+        return "S"
+    if total >= 90:
+        return "A+"
+    if total >= 80:
+        return "A"
+    if total >= 70:
+        return "B"
+    return "C"
+
+
+def checkmark(value):
+    return "✅" if bool(value) else "❌"
+
+
+def htf_status_line(coin, timeframe):
+    key = f"structure_note_{timeframe.lower()}"
+    aligned_key = f"htf_{timeframe.lower()}_aligned"
+    note = coin.get(key, "Not checked")
+    aligned = coin.get(aligned_key, False)
+    return f"{timeframe.upper()}: {note} | Aligned: {checkmark(aligned)}"
+
+
+def format_quality_breakdown(coin, discord=False):
+    if discord:
+        return (
+            f"Structure Quality: **{coin.get('quality_structure', 0)}/20**\n"
+            f"HTF Alignment Quality: **{coin.get('quality_htf', 0)}/20**\n"
+            f"Volume Quality: **{coin.get('quality_volume', 0)}/20**\n"
+            f"Range Location Quality: **{coin.get('quality_location', 0)}/20**\n"
+            f"Liquidity Event Quality: **{coin.get('quality_liquidity', 0)}/20**\n"
+            f"TOTAL QUALITY: **{coin.get('quality_total', 0)}/100**"
+        )
+
+    return (
+        f"  Structure Quality: {coin.get('quality_structure', 0)}/20\n"
+        f"  HTF Alignment Quality: {coin.get('quality_htf', 0)}/20\n"
+        f"  Volume Quality: {coin.get('quality_volume', 0)}/20\n"
+        f"  Range Location Quality: {coin.get('quality_location', 0)}/20\n"
+        f"  Liquidity Event Quality: {coin.get('quality_liquidity', 0)}/20\n"
+        f"  TOTAL QUALITY: {coin.get('quality_total', 0)}/100"
+    )
+
+
+def format_htf_confirmation(coin, discord=False):
+    line_1h = htf_status_line(coin, "1h")
+    line_4h = htf_status_line(coin, "4h")
+    alignment = coin.get('htf_alignment', 0)
+
+    if discord:
+        return (
+            f"{line_1h}\n"
+            f"{line_4h}\n"
+            f"HTF Alignment: **{alignment}/2**"
+        )
+
+    return (
+        f"  {line_1h}\n"
+        f"  {line_4h}\n"
+        f"  HTF Alignment: {alignment}/2"
+    )
+
+
+def ensure_quality_fields(coin):
+    """Force quality fields onto any coin dict before console/Discord formatting."""
+    required = [
+        "quality_structure",
+        "quality_htf",
+        "quality_volume",
+        "quality_location",
+        "quality_liquidity",
+        "quality_total",
+        "htf_alignment",
+        "htf_1h_aligned",
+        "htf_4h_aligned",
+    ]
+    if any(k not in coin for k in required):
+        coin.update(quality_breakdown(coin))
+    return coin
+
+
+def quality_summary_line(coin):
+    coin = ensure_quality_fields(coin)
+    return (
+        f"Quality Breakdown: "
+        f"Structure {coin.get('quality_structure', 0)}/20 | "
+        f"HTF {coin.get('quality_htf', 0)}/20 | "
+        f"Volume {coin.get('quality_volume', 0)}/20 | "
+        f"Range {coin.get('quality_location', 0)}/20 | "
+        f"Liquidity {coin.get('quality_liquidity', 0)}/20 | "
+        f"TOTAL {coin.get('quality_total', 0)}/100"
+    )
+
+
+def print_quality_breakdown(coin):
+    coin = ensure_quality_fields(coin)
+    # v32.7: one-line summary makes Railway search filters useful.
+    print(quality_summary_line(coin))
+    print(format_quality_breakdown(coin))
+    print("HTF Confirmation:")
+    print(format_htf_confirmation(coin))
+
+
 def is_s_tier_setup(coin):
     if not structure_agrees(coin):
         return False
@@ -717,252 +960,42 @@ def is_s_tier_setup(coin):
     return True
 
 
-def score_line_bar(value, max_value=20):
-    try:
-        value = float(value)
-        max_value = float(max_value)
-    except:
-        value = 0
-        max_value = 20
-
-    blocks = 10
-    filled = int(round((value / max_value) * blocks)) if max_value > 0 else 0
-    filled = max(0, min(blocks, filled))
-    return "█" * filled + "░" * (blocks - filled)
-
-
-def quality_grade(score):
-    try:
-        score = float(score)
-    except:
-        score = 0
-
-    if score >= S_TIER_QUALITY_THRESHOLD:
-        return "S-TIER"
-    if score >= A_PLUS_QUALITY_THRESHOLD:
-        return "A+"
-    if score >= A_QUALITY_THRESHOLD:
-        return "A"
-    if score >= B_QUALITY_THRESHOLD:
-        return "B"
-    return "C"
-
-
-def quality_structure_score(coin):
-    side = coin.get("trade_bias", "")
-    score = 0
-
-    if structure_agrees(coin):
-        score += 12
-
-    if side == "LONG":
-        if coin.get("structure_note_5m") == "Bullish BOS":
-            score += 3
-        elif coin.get("structure_note_5m") == "Bullish CHOCH":
-            score += 2
-        if coin.get("structure_note_15m") == "Bullish BOS":
-            score += 3
-        elif coin.get("structure_note_15m") == "Bullish CHOCH":
-            score += 2
-        if coin.get("last_candle_bullish_5m"):
-            score += 1
-        if coin.get("higher_low_5m"):
-            score += 1
-
-    if side == "SHORT":
-        if coin.get("structure_note_5m") == "Bearish BOS":
-            score += 3
-        elif coin.get("structure_note_5m") == "Bearish CHOCH":
-            score += 2
-        if coin.get("structure_note_15m") == "Bearish BOS":
-            score += 3
-        elif coin.get("structure_note_15m") == "Bearish CHOCH":
-            score += 2
-        if coin.get("last_candle_bearish_5m"):
-            score += 1
-        if coin.get("lower_high_5m"):
-            score += 1
-
-    return max(0, min(20, score))
-
-
-def quality_htf_score(coin):
-    score = 0
-    if htf_structure_agrees(coin, "1h"):
-        score += 12
-    if htf_structure_agrees(coin, "4h"):
-        score += 8
-    return max(0, min(20, score))
-
-
-def quality_volume_score(coin):
-    score = 0
-    spike_5m = safe_float(coin.get("volume_spike_5m"))
-    spike_15m = safe_float(coin.get("volume_spike_15m"))
-
-    if spike_5m >= 5:
-        score += 10
-    elif spike_5m >= 3:
-        score += 8
-    elif spike_5m >= 2:
-        score += 6
-    elif spike_5m >= 1.5:
-        score += 4
-    elif spike_5m >= 1:
-        score += 2
-
-    if spike_15m >= 4:
-        score += 10
-    elif spike_15m >= 2.5:
-        score += 8
-    elif spike_15m >= 1.5:
-        score += 6
-    elif spike_15m >= 1:
-        score += 3
-
-    return max(0, min(20, score))
-
-
-def quality_liquidity_score(coin):
-    side = coin.get("trade_bias", "")
-    score = 0
-
-    if side == "LONG":
-        if coin.get("sweep_low_5m"):
-            score += 10
-        if coin.get("range_pos", 100) <= 5:
-            score += 10
-        elif coin.get("range_pos", 100) <= 10:
-            score += 8
-        elif coin.get("range_pos", 100) <= 20:
-            score += 5
-        if coin.get("bounce_from_low", 0) >= 3:
-            score += 2
-
-    if side == "SHORT":
-        if coin.get("sweep_high_5m"):
-            score += 10
-        if coin.get("range_pos", 0) >= 95:
-            score += 10
-        elif coin.get("range_pos", 0) >= 90:
-            score += 8
-        elif coin.get("range_pos", 0) >= 80:
-            score += 5
-        if coin.get("pullback_from_high", 0) >= 3:
-            score += 2
-
-    return max(0, min(20, score))
-
-
-def quality_location_score(coin):
-    side = coin.get("trade_bias", "")
-    score = 0
-    rr = safe_float(coin.get("rr"))
-
-    if rr >= 3:
-        score += 8
-    elif rr >= 2:
-        score += 6
-    elif rr >= 1.5:
-        score += 3
-
-    if side == "LONG":
-        range_pos = safe_float(coin.get("range_pos"))
-        bounce = safe_float(coin.get("bounce_from_low"))
-        if range_pos <= 10:
-            score += 8
-        elif range_pos <= 20:
-            score += 6
-        elif range_pos <= 35:
-            score += 3
-        if 1 <= bounce <= 8:
-            score += 4
-        elif bounce > 8:
-            score += 2
-
-    if side == "SHORT":
-        range_pos = safe_float(coin.get("range_pos"))
-        pullback = safe_float(coin.get("pullback_from_high"))
-        if range_pos >= 90:
-            score += 8
-        elif range_pos >= 80:
-            score += 6
-        elif range_pos >= 65:
-            score += 3
-        if 1 <= pullback <= 8:
-            score += 4
-        elif pullback > 8:
-            score += 2
-
-    return max(0, min(20, score))
-
-
-def calculate_quality_breakdown(coin):
-    structure = quality_structure_score(coin)
-    htf = quality_htf_score(coin)
-    volume = quality_volume_score(coin)
-    liquidity = quality_liquidity_score(coin)
-    location = quality_location_score(coin)
-    total = structure + htf + volume + liquidity + location
-
-    return {
-        "structure": structure,
-        "htf_alignment": htf,
-        "volume_quality": volume,
-        "liquidity_event": liquidity,
-        "location_quality": location,
-        "total": max(0, min(100, total)),
-        "grade": quality_grade(total),
-    }
-
-
-def quality_breakdown_text(coin):
-    q = coin.get("quality_breakdown", {})
-    structure = q.get("structure", 0)
-    htf = q.get("htf_alignment", 0)
-    volume = q.get("volume_quality", 0)
-    liquidity = q.get("liquidity_event", 0)
-    location = q.get("location_quality", 0)
-    total = coin.get("quality_score", 0)
-    grade_value = coin.get("quality_grade", "")
-
-    return (
-        f"Structure: **{structure}/20** `{score_line_bar(structure)}`\n"
-        f"HTF Alignment: **{htf}/20** `{score_line_bar(htf)}`\n"
-        f"Volume Quality: **{volume}/20** `{score_line_bar(volume)}`\n"
-        f"Liquidity Event: **{liquidity}/20** `{score_line_bar(liquidity)}`\n"
-        f"Location Quality: **{location}/20** `{score_line_bar(location)}`\n\n"
-        f"Total Quality: **{total}/100** | Grade: **{grade_value}**"
-    )
+def has_min_htf_alignment(coin, minimum=ELITE_MIN_HTF_ALIGNMENT):
+    return coin.get("htf_alignment", 0) >= minimum
 
 
 def get_alert_tier(coin):
+    coin = ensure_quality_fields(coin)
     active = get_coin_active_side(coin)
     side = active["side"]
     grade_value = active["grade"]
     entry = active["entry"]
-    q_score = coin.get("quality_score", 0)
-    q_grade = coin.get("quality_grade", "")
+    quality = coin.get("quality_total", 0)
+    htf_count = coin.get("htf_alignment", 0)
+    both_structure = structure_agrees(coin)
 
-    if side == "SHORT":
-        both_structure = structure_agrees(coin)
+    if side not in ["SHORT", "LONG"]:
+        return ""
 
-        if q_grade == "S-TIER" and q_score >= S_TIER_QUALITY_THRESHOLD and grade_value == "A+" and entry >= DISCORD_ENTRY_THRESHOLD and both_structure and is_s_tier_setup(coin):
-            return "🏆 INSTITUTIONAL S-TIER SHORT SETUP"
-        if q_grade in ["S-TIER", "A+"] and q_score >= A_PLUS_QUALITY_THRESHOLD and grade_value == "A+" and entry >= DISCORD_ENTRY_THRESHOLD and both_structure:
-            return "🚨 INSTITUTIONAL A+ SHORT SETUP"
-        if not ELITE_ONLY and q_grade in ["A", "A+"] and entry >= DISCORD_ENTRY_THRESHOLD:
-            return "⚠️ A SHORT WATCHLIST"
+    # S-Tier remains strict.
+    if grade_value == "S" and entry >= DISCORD_ENTRY_THRESHOLD and both_structure and is_s_tier_setup(coin):
+        return f"🏆 S-TIER {side} SETUP"
 
-    if side == "LONG":
-        both_structure = structure_agrees(coin)
+    # v32.7: quality-based elite alerts.
+    # This allows setups like Quality 60+/100 with HTF alignment to post even if legacy grade is C/B.
+    if quality >= DISCORD_MIN_QUALITY and entry >= DISCORD_ENTRY_THRESHOLD and htf_count >= DISCORD_REQUIRE_HTF_ALIGNMENT:
+        if quality >= 80:
+            return f"🚨 ELITE {side} SETUP"
+        if quality >= 70:
+            return f"⚔️ A-GRADE {side} WATCH"
+        return f"📡 QUALITY {side} WATCH"
 
-        if q_grade == "S-TIER" and q_score >= S_TIER_QUALITY_THRESHOLD and grade_value == "A+" and entry >= DISCORD_ENTRY_THRESHOLD and both_structure and is_s_tier_setup(coin):
-            return "🏆 INSTITUTIONAL S-TIER LONG SETUP"
-        if q_grade in ["S-TIER", "A+"] and q_score >= A_PLUS_QUALITY_THRESHOLD and grade_value == "A+" and entry >= DISCORD_ENTRY_THRESHOLD and both_structure:
-            return "💰 INSTITUTIONAL A+ LONG SETUP"
-        if not ELITE_ONLY and q_grade in ["A", "A+"] and entry >= DISCORD_ENTRY_THRESHOLD:
-            return "🟢 A LONG WATCHLIST"
+    # Legacy grade fallback.
+    if grade_value in ["S", "A+"] and entry >= DISCORD_ENTRY_THRESHOLD and both_structure and htf_count >= ELITE_MIN_HTF_ALIGNMENT:
+        return f"🚨 ELITE A+ {side} SETUP"
+
+    if not ELITE_ONLY and grade_value in ["S", "A+", "A"] and entry >= DISCORD_ENTRY_THRESHOLD:
+        return f"⚠️ A {side} WATCHLIST"
 
     return ""
 
@@ -986,34 +1019,39 @@ def should_send_alert(coin):
     if not DISCORD_WEBHOOK_URL:
         return False
 
+    coin = ensure_quality_fields(coin)
     active = get_coin_active_side(coin)
     side = active["side"]
     score = active["score"]
     grade_value = active["grade"]
     entry = active["entry"]
-    q_score = coin.get("quality_score", 0)
-    q_grade = coin.get("quality_grade", "")
+    quality = coin.get("quality_total", 0)
+    htf_count = coin.get("htf_alignment", 0)
 
     if side not in ["SHORT", "LONG"]:
         return False
 
-    if REQUIRE_QUALITY_FOR_DISCORD:
-        if q_score < QUALITY_ALERT_THRESHOLD:
-            return False
-        if q_grade not in ["A+", "S-TIER"]:
-            return False
+    # v32.7 main Discord gate: quality + HTF + entry readiness.
+    # This replaces the overly strict A+/legacy-grade-only gate that caused Eligible: 0.
+    quality_alert = (
+        quality >= DISCORD_MIN_QUALITY
+        and htf_count >= DISCORD_REQUIRE_HTF_ALIGNMENT
+        and entry >= DISCORD_ENTRY_THRESHOLD
+    )
+
+    legacy_alert = (
+        grade_value in ["S", "A+"]
+        and structure_agrees(coin)
+        and htf_count >= ELITE_MIN_HTF_ALIGNMENT
+        and entry >= DISCORD_ENTRY_THRESHOLD
+    )
 
     if ELITE_ONLY:
-        if grade_value != "A+":
-            return False
-        if not structure_agrees(coin):
+        if not (quality_alert or legacy_alert):
             return False
     else:
-        if grade_value not in ["A", "A+"]:
+        if grade_value not in ["A", "A+", "S"] and not quality_alert:
             return False
-
-    if entry < DISCORD_ENTRY_THRESHOLD:
-        return False
 
     if coin["rr"] == "":
         return False
@@ -1044,7 +1082,7 @@ def should_send_alert(coin):
     previous_entry = previous.get("entry", 0)
     previous_tier = previous.get("tier", "")
 
-    tier_improved = tier != previous_tier and "A+" in tier and "A+" not in previous_tier
+    tier_improved = tier != previous_tier and ("ELITE" in tier or "S-TIER" in tier)
     score_improved = score >= previous_score + SCORE_IMPROVEMENT_REQUIRED
     entry_improved = entry >= previous_entry + ENTRY_IMPROVEMENT_REQUIRED
 
@@ -1055,7 +1093,6 @@ def should_send_alert(coin):
         return True
 
     return False
-
 
 def mark_alert_sent(coin):
     alerts = load_alerts()
@@ -1072,8 +1109,6 @@ def mark_alert_sent(coin):
         "score": active["score"],
         "entry": active["entry"],
         "rr": coin["rr"],
-        "quality_score": coin.get("quality_score", 0),
-        "quality_grade": coin.get("quality_grade", ""),
     }
 
     save_alerts(alerts)
@@ -1150,6 +1185,7 @@ def categorize_reasons(coin):
 
 
 def build_discord_embed(coin):
+    coin = ensure_quality_fields(coin)
     active = get_coin_active_side(coin)
     tier = get_alert_tier(coin)
     structure_reasons, catalyst_reasons, other_reasons = categorize_reasons(coin)
@@ -1159,9 +1195,8 @@ def build_discord_embed(coin):
     description = (
         f"{get_alert_header(coin)}\n"
         f"**Alert Type:** {tier}\n"
-        f"**Grade:** {active['grade']} | **Legacy Score:** {active['score']} | "
+        f"**Grade:** {active['grade']} | **Score:** {active['score']} | "
         f"**Entry Ready:** {active['entry']} | **R:R:** {coin['rr']}\n"
-        f"**Institutional Quality:** **{coin.get('quality_score', 0)}/100** | **{coin.get('quality_grade', '')}**\n"
         f"**Confidence:** `{confidence_bar(active['entry'])}` {active['entry']}%"
     )
 
@@ -1201,15 +1236,15 @@ def build_discord_embed(coin):
             {
                 "name": "HTF Confirmation",
                 "value": (
-                    f"1H Aligned: **{htf_structure_agrees(coin, '1h')}**\n"
-                    f"4H Aligned: **{htf_structure_agrees(coin, '4h')}**\n"
-                    f"HTF Score Boost: **{coin.get('htf_bonus', 0)}**"
+                    format_htf_confirmation(coin, discord=True)
                 ),
                 "inline": False,
             },
             {
-                "name": "Institutional Quality Score",
-                "value": quality_breakdown_text(coin)[:1000],
+                "name": "Quality Breakdown",
+                "value": (
+                    format_quality_breakdown(coin, discord=True)
+                ),
                 "inline": False,
             },
             {
@@ -1242,13 +1277,15 @@ def build_discord_embed(coin):
             "inline": False,
         })
 
-    if CHART_IMAGE_URL:
-        embed["image"] = {"url": CHART_IMAGE_URL}
+    snapshot_url = coin.get("snapshot_url") or coin.get("screenshot_url") or CHART_IMAGE_URL
+    if snapshot_url:
+        embed["image"] = {"url": snapshot_url}
 
     return embed
 
 
 def build_plain_discord_message(coin):
+    coin = ensure_quality_fields(coin)
     active = get_coin_active_side(coin)
     tier = get_alert_tier(coin)
     structure_reasons, catalyst_reasons, other_reasons = categorize_reasons(coin)
@@ -1265,20 +1302,22 @@ def build_plain_discord_message(coin):
 **Alert Type:** {tier}
 **Bias:** {coin['trade_bias']}
 **Grade:** {active['grade']}
-**Legacy Score:** {active['score']}
+**Score:** {active['score']}
 **Entry Readiness:** {active['entry']}
-**Institutional Quality:** {coin.get('quality_score', 0)}/100 — {coin.get('quality_grade', '')}
 **Confidence:** `{confidence_bar(active['entry'])}` {active['entry']}%
 **Estimated R:R:** {coin['rr']}
-
-**Institutional Quality Score**
-{quality_breakdown_text(coin)}
 
 **Market Snapshot**
 24h Move: {coin['change_24h']}%
 Range Position: {coin['range_pos']}%
 5m Volume Spike: {coin['volume_spike_5m']}x
 15m Volume Spike: {coin['volume_spike_15m']}x
+
+**HTF Confirmation**
+{format_htf_confirmation(coin, discord=True)}
+
+**Quality Breakdown**
+{format_quality_breakdown(coin, discord=True)}
 
 **Market Structure**
 5m: {coin['structure_note_5m']}
@@ -1297,6 +1336,7 @@ Target 1: {coin['target1']}
 Target 2: {coin['target2']}
 
 **Chart:** {coin['tradingview']}
+**Snapshot:** {coin.get('snapshot_url', 'Pending / unavailable')}
 
 _Not financial advice. Confirm manually before entry._
 """
@@ -1953,12 +1993,223 @@ def update_active_trades(tickers):
     elif POST_STATS_AFTER_TP1 and tp1_updates > 0:
         send_performance_stats_discord("TP1 HIT")
 
+
+def airtable_enabled():
+    return bool(AIRTABLE_TOKEN and AIRTABLE_BASE_ID and AIRTABLE_SCANNER_TABLE and PUSH_SCANNER_ALERTS_TO_AIRTABLE)
+
+
+def airtable_headers():
+    return {
+        "Authorization": f"Bearer {AIRTABLE_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+
+def airtable_table_url():
+    table = AIRTABLE_SCANNER_TABLE.replace(" ", "%20")
+    return f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{table}"
+
+
+def scanner_alert_summary(coin):
+    active = get_coin_active_side(coin)
+    tier = get_alert_tier(coin)
+    reasons = coin.get("setup_reasons", "")
+    reason_bits = [r.strip() for r in reasons.split(" | ") if r.strip()]
+    short_reasons = " • ".join(reason_bits[:3]) if reason_bits else "Scanner-qualified setup. Manual chart confirmation required."
+    return (
+        f"{tier} | {coin.get('symbol', '')} {coin.get('trade_bias', '')} | "
+        f"Grade {active.get('grade', '')} | Score {active.get('score', 0)} | "
+        f"Entry readiness {active.get('entry', 0)} | R:R {coin.get('rr', '')}. "
+        f"{short_reasons}"
+    )
+
+
+
+def netlify_snapshots_enabled():
+    return bool(ENABLE_NETLIFY_SNAPSHOTS and NETLIFY_SITE_URL)
+
+
+def snapshot_function_url():
+    return f"{NETLIFY_SITE_URL}/.netlify/functions/save-scanner-snapshot"
+
+
+def clean_snapshot_candles(candles):
+    clean = []
+    for c in candles[-SNAPSHOT_CANDLE_LIMIT:]:
+        try:
+            clean.append({
+                "time": c.get("time", ""),
+                "open": float(c.get("open", 0)),
+                "high": float(c.get("high", 0)),
+                "low": float(c.get("low", 0)),
+                "close": float(c.get("close", 0)),
+                "volume": float(c.get("volume_usdt", 0)),
+            })
+        except Exception:
+            continue
+    return clean
+
+
+def build_snapshot_payload(coin, record_id=""):
+    coin = ensure_quality_fields(coin)
+    active = get_coin_active_side(coin)
+    tier = get_alert_tier(coin)
+
+    candles = get_candles(coin.get("symbol", ""), SNAPSHOT_TIMEFRAME, SNAPSHOT_CANDLE_LIMIT)
+    entry_zone = ""
+    if coin.get("entry_low") != "" and coin.get("entry_high") != "":
+        entry_zone = f"{coin.get('entry_low')} - {coin.get('entry_high')}"
+
+    targets = ""
+    if coin.get("target1") != "" or coin.get("target2") != "":
+        targets = f"TP1: {coin.get('target1')} | TP2: {coin.get('target2')}"
+
+    return {
+        "pair": coin.get("symbol", ""),
+        "direction": coin.get("trade_bias", active.get("side", "")),
+        "score": active.get("score", 0),
+        "grade": active.get("grade", ""),
+        "entry": entry_zone,
+        "entryZone": entry_zone,
+        "invalidation": str(coin.get("stop", "")),
+        "targets": targets,
+        "timeframe": SNAPSHOT_TIMEFRAME,
+        "timeframes": "5m / 15m / 1H / 4H",
+        "alertType": tier,
+        "quality": coin.get("quality_total", 0),
+        "rr": str(coin.get("rr", "")),
+        "tradingview": coin.get("tradingview", ""),
+        "summary": scanner_alert_summary(coin),
+        "reasons": coin.get("setup_reasons", ""),
+        "recordId": record_id,
+        "updateAirtable": False,
+        "candles": clean_snapshot_candles(candles),
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+
+
+def create_netlify_snapshot(coin, record_id=""):
+    """Creates a branded chart snapshot through Netlify v63 and returns its public URL."""
+    if not netlify_snapshots_enabled():
+        return ""
+
+    try:
+        payload = build_snapshot_payload(coin, record_id=record_id)
+        if not payload.get("candles"):
+            print(f"Snapshot skipped: no candles for {coin.get('symbol', '')}")
+            return ""
+
+        headers = {"Content-Type": "application/json"}
+        if NETLIFY_SNAPSHOT_SECRET:
+            headers["X-Citadel-Secret"] = NETLIFY_SNAPSHOT_SECRET
+
+        r = requests.post(snapshot_function_url(), headers=headers, json=payload, timeout=20)
+        if r.status_code not in [200, 201]:
+            print(f"Snapshot save failed: {r.status_code} {r.text}")
+            return ""
+
+        data = r.json()
+        snapshot_url = data.get("snapshotUrl", "")
+        if snapshot_url:
+            print(f"Snapshot saved: {coin.get('symbol', '')} -> {snapshot_url}")
+            return snapshot_url
+
+        print(f"Snapshot save returned no URL: {data}")
+        return ""
+
+    except Exception as e:
+        print(f"Snapshot error: {e}")
+        return ""
+
+
+def ensure_coin_snapshot(coin):
+    """Attach snapshot_url to coin if one has not already been generated."""
+    if coin.get("snapshot_url"):
+        return coin.get("snapshot_url")
+
+    snapshot_url = create_netlify_snapshot(coin)
+    if snapshot_url:
+        coin["snapshot_url"] = snapshot_url
+        coin["screenshot_url"] = snapshot_url
+    return snapshot_url
+
+
+def push_scanner_alert_to_airtable(coin):
+    """Pushes scanner alert into Airtable so the website can show latest alerts."""
+    if not airtable_enabled():
+        return False
+
+    try:
+        coin = ensure_quality_fields(coin)
+        active = get_coin_active_side(coin)
+        tier = get_alert_tier(coin)
+
+        entry_zone = ""
+        if coin.get("entry_low") != "" and coin.get("entry_high") != "":
+            entry_zone = f"{coin.get('entry_low')} - {coin.get('entry_high')}"
+
+        targets = ""
+        if coin.get("target1") != "" or coin.get("target2") != "":
+            targets = f"TP1: {coin.get('target1')} | TP2: {coin.get('target2')}"
+
+        fields = {
+            "Pair": coin.get("symbol", ""),
+            "Direction": coin.get("trade_bias", active.get("side", "")),
+            "Grade": active.get("grade", ""),
+            "Score": active.get("score", 0),
+            "Summary": scanner_alert_summary(coin),
+            "Entry Zone": entry_zone,
+            "Invalidation": str(coin.get("stop", "")),
+            "Targets": targets,
+            "Timeframe": "5m / 15m / 1H / 4H",
+            "Date": datetime.utcnow().isoformat(),
+            "Published": True,
+            "Featured": True,
+        }
+
+        snapshot_url = coin.get("snapshot_url") or coin.get("screenshot_url") or ""
+        if snapshot_url and AIRTABLE_SCREENSHOT_FIELD:
+            fields[AIRTABLE_SCREENSHOT_FIELD] = snapshot_url
+
+        # Optional fields: only sent if your Airtable table has matching columns.
+        optional_fields = {
+            "Alert Type": tier,
+            "Entry Readiness": active.get("entry", 0),
+            "R:R": str(coin.get("rr", "")),
+            "TradingView": coin.get("tradingview", ""),
+            "Quality": coin.get("quality_total", 0),
+            "Structure": coin.get("quality_structure", 0),
+            "HTF": coin.get("quality_htf", 0),
+            "Volume": coin.get("quality_volume", 0),
+            "Location": coin.get("quality_location", 0),
+            "Liquidity": coin.get("quality_liquidity", 0),
+        }
+
+        payload = {"records": [{"fields": fields}]}
+        r = requests.post(airtable_table_url(), headers=airtable_headers(), json=payload, timeout=10)
+
+        # If optional fields exist in Airtable later, a second version can include them.
+        if r.status_code in [200, 201]:
+            print(f"Airtable scanner alert pushed: {coin.get('symbol')} {coin.get('trade_bias')} {tier}")
+            return True
+
+        print(f"Airtable push failed: {r.status_code} {r.text}")
+        return False
+
+    except Exception as e:
+        print(f"Airtable push error: {e}")
+        return False
+
+
 def send_discord_alert(coin):
     if not DISCORD_WEBHOOK_URL:
         return
 
     tier = get_alert_tier(coin)
     mention = f"{VIP_ROLE_MENTION}\n" if PING_ROLE_ON_ELITE and VIP_ROLE_MENTION else ""
+
+    # v64: create the Netlify snapshot before building the Discord embed and Airtable row.
+    ensure_coin_snapshot(coin)
 
     if USE_DISCORD_EMBEDS:
         payload = {
@@ -1973,6 +2224,7 @@ def send_discord_alert(coin):
 
         if r.status_code in [200, 204]:
             print(f"Discord alert sent: {coin['symbol']} {coin['trade_bias']} {tier}")
+            push_scanner_alert_to_airtable(coin)
             mark_alert_sent(coin)
             register_active_trade(coin)
         else:
@@ -2167,17 +2419,22 @@ def build_results(tickers):
             "target1": trade_plan["target1"] if trade_plan else "",
             "target2": trade_plan["target2"] if trade_plan else "",
             "rr": trade_plan["rr"] if trade_plan else "",
+            "stop_safety_adjusted": trade_plan.get("stop_safety_adjusted", False) if trade_plan else False,
         }
 
-        if ENABLE_QUALITY_SCORE_ENGINE:
-            quality = calculate_quality_breakdown(result)
-            result["quality_breakdown"] = quality
-            result["quality_score"] = quality["total"]
-            result["quality_grade"] = quality["grade"]
-        else:
-            result["quality_breakdown"] = {}
-            result["quality_score"] = 0
-            result["quality_grade"] = ""
+        q = quality_breakdown(result)
+        result.update(q)
+
+        # v32.4: Use quality engine to rebalance visible grade/score for the active side.
+        # This reduces "everything is A+" clustering while preserving the legacy fields as backup.
+        q_total = result["quality_total"]
+        q_grade = quality_grade(q_total)
+        if result["trade_bias"] == "SHORT":
+            result["short_score"] = q_total
+            result["short_grade"] = q_grade
+        elif result["trade_bias"] == "LONG":
+            result["long_score"] = q_total
+            result["long_grade"] = q_grade
 
         if result["trade_bias"] == "SHORT":
             setup_reasons = build_setup_reasons(result, "short")
@@ -2228,6 +2485,7 @@ def print_trade_plan(coin):
     print(f"  Target 1: {coin['target1']}")
     print(f"  Target 2: {coin['target2']}")
     print(f"  Estimated R:R: {coin['rr']}")
+    print(f"  Stop Safety: {'Adjusted - invalidation forced outside entry zone' if coin.get('stop_safety_adjusted') else 'OK'}")
 
 
 def print_section(title, coins, sort_key, limit=10):
@@ -2246,13 +2504,13 @@ def print_section(title, coins, sort_key, limit=10):
         active_score = coin["short_score"] if is_short else coin["long_score"]
         active_entry = coin["short_entry_readiness"] if is_short else coin["long_entry_readiness"]
 
+        coin = ensure_quality_fields(coin)
         print(
             f"{coin['symbol']} | "
             f"Bias: {coin['trade_bias']} | "
             f"Grade: {active_grade} | "
             f"Score: {active_score} | "
             f"Entry: {active_entry} | "
-            f"Quality: {coin.get('quality_score', 0)}/{coin.get('quality_grade', '')} | "
             f"24h: {coin['change_24h']}% | "
             f"Range: {coin['range_pos']}% | "
             f"5m Spike: {coin['volume_spike_5m']}x | "
@@ -2261,11 +2519,11 @@ def print_section(title, coins, sort_key, limit=10):
             f"15m: {coin['structure_note_15m']} | "
             f"1H: {coin.get('structure_note_1h', 'Not checked')} | "
             f"4H: {coin.get('structure_note_4h', 'Not checked')} | "
+            f"HTF: {coin.get('htf_alignment', 0)}/2 | "
+            f"Quality: {coin.get('quality_total', 0)}/100 | "
             f"{coin['signal']}"
         )
-        if coin.get("quality_breakdown"):
-            q = coin["quality_breakdown"]
-            print(f"Quality Breakdown: Structure {q.get('structure',0)}/20 | HTF {q.get('htf_alignment',0)}/20 | Volume {q.get('volume_quality',0)}/20 | Liquidity {q.get('liquidity_event',0)}/20 | Location {q.get('location_quality',0)}/20 | Total {coin.get('quality_score',0)}/100 {coin.get('quality_grade','')}")
+        print_quality_breakdown(coin)
         print_reasons(coin)
         print_trade_plan(coin)
 
@@ -2449,7 +2707,7 @@ def send_daily_report_discord():
 
 def run_scanner():
     print("\n" + "=" * 190)
-    print("CITADEL TRADE OPPORTUNITY SCANNER v32 — INSTITUTIONAL QUALITY SCORE ENGINE")
+    print("CITADEL TRADE OPPORTUNITY SCANNER v34 — NETLIFY SNAPSHOTS + AIRTABLE PUSH")
     print(f"Scan Time: {datetime.now()}")
     print("=" * 190)
 
@@ -2492,7 +2750,7 @@ def run_scanner():
     print("\n" + "-" * 190)
     print(f"Saved {len(results)} rows to {LOG_FILE}")
     print(f"Checked 5m + 15m candles for top {MAX_CANDLE_CHECKS} movers only.")
-    print("Reminder: v32 adds institutional quality scoring, score breakdowns, and stricter elite filtering.")
+    print("Reminder: v34 can create Netlify chart snapshots and write Screenshot URL to Airtable.")
 
 
 if __name__ == "__main__":
