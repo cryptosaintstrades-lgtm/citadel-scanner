@@ -1,1 +1,1 @@
-python citadel_scanner_v35_netlify_snapshots.py
+worker: python citadel_scanner_v35_netlify_snapshots.py
