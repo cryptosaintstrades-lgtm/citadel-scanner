@@ -1,1 +1,1 @@
-worker: python citadel_scanner_v32_8_stop_safety_patch.py
+python citadel_scanner_v32_quality_engine.py
