@@ -2459,8 +2459,20 @@ def log_results(results):
 
     file_exists = os.path.isfile(LOG_FILE)
 
+    # v35.1 fix:
+    # Some rows can receive snapshot_url / screenshot_url after the first result is built.
+    # csv.DictWriter fails if later rows contain fields that were not in results[0].
+    # Build the CSV header from the union of every row's keys, then safely write rows.
+    fieldnames = []
+    for row in results:
+        for key in row.keys():
+            if key not in fieldnames:
+                fieldnames.append(key)
+    if "scan_time" not in fieldnames:
+        fieldnames.append("scan_time")
+
     with open(LOG_FILE, "a", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(file, fieldnames=list(results[0].keys()) + ["scan_time"])
+        writer = csv.DictWriter(file, fieldnames=fieldnames, extrasaction="ignore")
 
         if not file_exists:
             writer.writeheader()
@@ -2711,7 +2723,7 @@ def send_daily_report_discord():
 
 def run_scanner():
     print("\n" + "=" * 190)
-    print("CITADEL TRADE OPPORTUNITY SCANNER v35 — NETLIFY SNAPSHOTS FORCE START")
+    print("CITADEL TRADE OPPORTUNITY SCANNER v35.1 — NETLIFY SNAPSHOTS + CSV FIELD FIX")
     print(f"Scan Time: {datetime.now()}")
     print("=" * 190)
 
