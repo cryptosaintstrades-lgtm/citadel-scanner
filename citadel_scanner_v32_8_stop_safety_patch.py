@@ -12,7 +12,7 @@ BLOFIN_CANDLES_URL = "https://openapi.blofin.com/api/v1/market/candles"
 # Paste your webhook between the quotes below.
 # Railway use later:
 # Add DISCORD_WEBHOOK_URL as an environment variable and Railway will override this.
-DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/1517639929168138430/_CUqmvSPvB-Bw_6ap1kSaDkkZXQaHkmJr-DkYdBkBqbFljohAJnlv1A_QwWkJu1v3K6b")
+DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/1515481202365038632/p3V0Se4CAdGYmEJ0wOld5rM-oHlsdg8P1TPvRhxiWm9qS95OYLiQ3U1JnYvsJlzy5ctH")
 
 SCAN_EVERY_SECONDS = 300
 LOG_FILE = "scanner_log.csv"
@@ -32,6 +32,16 @@ AIRTABLE_BASE_ID = os.environ.get("AIRTABLE_BASE_ID", "appSwudFWMM3ETD68")
 AIRTABLE_SCANNER_TABLE = os.environ.get("AIRTABLE_SCANNER_TABLE", "Scanner Alerts")
 PUSH_SCANNER_ALERTS_TO_AIRTABLE = os.environ.get("PUSH_SCANNER_ALERTS_TO_AIRTABLE", "false").lower() == "true"
 
+# v34 / v64 Netlify snapshot integration
+# Website v63 provides /.netlify/functions/save-scanner-snapshot.
+# The scanner sends candle data there, Netlify Blobs stores a branded SVG,
+# then this bot writes the returned URL into Airtable's Screenshot URL field.
+NETLIFY_SITE_URL = os.environ.get("NETLIFY_SITE_URL", "https://theliquiditycitadel.trade").rstrip("/")
+ENABLE_NETLIFY_SNAPSHOTS = os.environ.get("ENABLE_NETLIFY_SNAPSHOTS", "true").lower() == "true"
+NETLIFY_SNAPSHOT_SECRET = os.environ.get("NETLIFY_SNAPSHOT_SECRET", os.environ.get("SNAPSHOT_INGEST_SECRET", ""))
+SNAPSHOT_TIMEFRAME = os.environ.get("SNAPSHOT_TIMEFRAME", "5m")
+SNAPSHOT_CANDLE_LIMIT = int(os.environ.get("SNAPSHOT_CANDLE_LIMIT", "80"))
+AIRTABLE_SCREENSHOT_FIELD = os.environ.get("AIRTABLE_SCREENSHOT_FIELD", "Screenshot URL")
 
 
 MIN_24H_MOVE_FOR_CANDLES = 5
@@ -1267,8 +1277,9 @@ def build_discord_embed(coin):
             "inline": False,
         })
 
-    if CHART_IMAGE_URL:
-        embed["image"] = {"url": CHART_IMAGE_URL}
+    snapshot_url = coin.get("snapshot_url") or coin.get("screenshot_url") or CHART_IMAGE_URL
+    if snapshot_url:
+        embed["image"] = {"url": snapshot_url}
 
     return embed
 
@@ -1325,6 +1336,7 @@ Target 1: {coin['target1']}
 Target 2: {coin['target2']}
 
 **Chart:** {coin['tradingview']}
+**Snapshot:** {coin.get('snapshot_url', 'Pending / unavailable')}
 
 _Not financial advice. Confirm manually before entry._
 """
@@ -2012,6 +2024,116 @@ def scanner_alert_summary(coin):
     )
 
 
+
+def netlify_snapshots_enabled():
+    return bool(ENABLE_NETLIFY_SNAPSHOTS and NETLIFY_SITE_URL)
+
+
+def snapshot_function_url():
+    return f"{NETLIFY_SITE_URL}/.netlify/functions/save-scanner-snapshot"
+
+
+def clean_snapshot_candles(candles):
+    clean = []
+    for c in candles[-SNAPSHOT_CANDLE_LIMIT:]:
+        try:
+            clean.append({
+                "time": c.get("time", ""),
+                "open": float(c.get("open", 0)),
+                "high": float(c.get("high", 0)),
+                "low": float(c.get("low", 0)),
+                "close": float(c.get("close", 0)),
+                "volume": float(c.get("volume_usdt", 0)),
+            })
+        except Exception:
+            continue
+    return clean
+
+
+def build_snapshot_payload(coin, record_id=""):
+    coin = ensure_quality_fields(coin)
+    active = get_coin_active_side(coin)
+    tier = get_alert_tier(coin)
+
+    candles = get_candles(coin.get("symbol", ""), SNAPSHOT_TIMEFRAME, SNAPSHOT_CANDLE_LIMIT)
+    entry_zone = ""
+    if coin.get("entry_low") != "" and coin.get("entry_high") != "":
+        entry_zone = f"{coin.get('entry_low')} - {coin.get('entry_high')}"
+
+    targets = ""
+    if coin.get("target1") != "" or coin.get("target2") != "":
+        targets = f"TP1: {coin.get('target1')} | TP2: {coin.get('target2')}"
+
+    return {
+        "pair": coin.get("symbol", ""),
+        "direction": coin.get("trade_bias", active.get("side", "")),
+        "score": active.get("score", 0),
+        "grade": active.get("grade", ""),
+        "entry": entry_zone,
+        "entryZone": entry_zone,
+        "invalidation": str(coin.get("stop", "")),
+        "targets": targets,
+        "timeframe": SNAPSHOT_TIMEFRAME,
+        "timeframes": "5m / 15m / 1H / 4H",
+        "alertType": tier,
+        "quality": coin.get("quality_total", 0),
+        "rr": str(coin.get("rr", "")),
+        "tradingview": coin.get("tradingview", ""),
+        "summary": scanner_alert_summary(coin),
+        "reasons": coin.get("setup_reasons", ""),
+        "recordId": record_id,
+        "updateAirtable": False,
+        "candles": clean_snapshot_candles(candles),
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+
+
+def create_netlify_snapshot(coin, record_id=""):
+    """Creates a branded chart snapshot through Netlify v63 and returns its public URL."""
+    if not netlify_snapshots_enabled():
+        return ""
+
+    try:
+        payload = build_snapshot_payload(coin, record_id=record_id)
+        if not payload.get("candles"):
+            print(f"Snapshot skipped: no candles for {coin.get('symbol', '')}")
+            return ""
+
+        headers = {"Content-Type": "application/json"}
+        if NETLIFY_SNAPSHOT_SECRET:
+            headers["X-Citadel-Secret"] = NETLIFY_SNAPSHOT_SECRET
+
+        r = requests.post(snapshot_function_url(), headers=headers, json=payload, timeout=20)
+        if r.status_code not in [200, 201]:
+            print(f"Snapshot save failed: {r.status_code} {r.text}")
+            return ""
+
+        data = r.json()
+        snapshot_url = data.get("snapshotUrl", "")
+        if snapshot_url:
+            print(f"Snapshot saved: {coin.get('symbol', '')} -> {snapshot_url}")
+            return snapshot_url
+
+        print(f"Snapshot save returned no URL: {data}")
+        return ""
+
+    except Exception as e:
+        print(f"Snapshot error: {e}")
+        return ""
+
+
+def ensure_coin_snapshot(coin):
+    """Attach snapshot_url to coin if one has not already been generated."""
+    if coin.get("snapshot_url"):
+        return coin.get("snapshot_url")
+
+    snapshot_url = create_netlify_snapshot(coin)
+    if snapshot_url:
+        coin["snapshot_url"] = snapshot_url
+        coin["screenshot_url"] = snapshot_url
+    return snapshot_url
+
+
 def push_scanner_alert_to_airtable(coin):
     """Pushes scanner alert into Airtable so the website can show latest alerts."""
     if not airtable_enabled():
@@ -2044,6 +2166,10 @@ def push_scanner_alert_to_airtable(coin):
             "Published": True,
             "Featured": True,
         }
+
+        snapshot_url = coin.get("snapshot_url") or coin.get("screenshot_url") or ""
+        if snapshot_url and AIRTABLE_SCREENSHOT_FIELD:
+            fields[AIRTABLE_SCREENSHOT_FIELD] = snapshot_url
 
         # Optional fields: only sent if your Airtable table has matching columns.
         optional_fields = {
@@ -2081,6 +2207,9 @@ def send_discord_alert(coin):
 
     tier = get_alert_tier(coin)
     mention = f"{VIP_ROLE_MENTION}\n" if PING_ROLE_ON_ELITE and VIP_ROLE_MENTION else ""
+
+    # v64: create the Netlify snapshot before building the Discord embed and Airtable row.
+    ensure_coin_snapshot(coin)
 
     if USE_DISCORD_EMBEDS:
         payload = {
@@ -2578,7 +2707,7 @@ def send_daily_report_discord():
 
 def run_scanner():
     print("\n" + "=" * 190)
-    print("CITADEL TRADE OPPORTUNITY SCANNER v33 — AIRTABLE PUSH + STOP SAFETY")
+    print("CITADEL TRADE OPPORTUNITY SCANNER v34 — NETLIFY SNAPSHOTS + AIRTABLE PUSH")
     print(f"Scan Time: {datetime.now()}")
     print("=" * 190)
 
@@ -2621,7 +2750,7 @@ def run_scanner():
     print("\n" + "-" * 190)
     print(f"Saved {len(results)} rows to {LOG_FILE}")
     print(f"Checked 5m + 15m candles for top {MAX_CANDLE_CHECKS} movers only.")
-    print("Reminder: v33 pushes qualified Discord alerts to Airtable when enabled.")
+    print("Reminder: v34 can create Netlify chart snapshots and write Screenshot URL to Airtable.")
 
 
 if __name__ == "__main__":
