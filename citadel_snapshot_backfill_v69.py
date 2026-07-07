@@ -21,7 +21,7 @@ from urllib.parse import quote
 import requests
 
 
-VERSION = "v69-snapshot-backfill"
+VERSION = "v69.1-snapshot-backfill-table-id-support"
 
 
 def env(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -50,8 +50,10 @@ def env_int(name: str, default: int) -> int:
 
 AIRTABLE_TOKEN = env("AIRTABLE_TOKEN") or env("AIRTABLE_API_KEY")
 AIRTABLE_BASE_ID = env("AIRTABLE_BASE_ID")
-AIRTABLE_TABLE_NAME = (
-    env("AIRTABLE_SCANNER_TABLE")
+AIRTABLE_TABLE_REF = (
+    env("AIRTABLE_SCANNER_TABLE_ID")
+    or env("AIRTABLE_TABLE_ID")
+    or env("AIRTABLE_SCANNER_TABLE")
     or env("AIRTABLE_TABLE_NAME")
     or env("AIRTABLE_TABLE")
     or "Scanner Alerts"
@@ -181,7 +183,7 @@ def normalize_timeframe(timeframe: Any) -> str:
 
 
 def airtable_url(path: str = "") -> str:
-    table = quote(AIRTABLE_TABLE_NAME, safe="")
+    table = quote(AIRTABLE_TABLE_REF, safe="")
     return f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{table}{path}"
 
 
@@ -208,7 +210,11 @@ def list_missing_records(limit: int) -> List[Dict[str, Any]]:
         )
         if response.status_code >= 400:
             raise RuntimeError(
-                f"Airtable list failed {response.status_code}: {response.text[:600]}"
+                f"Airtable list failed {response.status_code}: {response.text[:600]}\n"
+                f"Checked table reference: {AIRTABLE_TABLE_REF}\n"
+                "Fix: copy the exact table variable from the live SCANNER service. "
+                "If the live scanner uses a tbl... ID, set AIRTABLE_TABLE_ID or "
+                "AIRTABLE_SCANNER_TABLE_ID on BACKFILL."
             )
         data = response.json()
         records.extend(data.get("records", []))
@@ -387,7 +393,7 @@ def run() -> None:
     print(f"BOOT CHECK: {VERSION}")
     print(
         "Backfill config | "
-        f"table={AIRTABLE_TABLE_NAME} | field={AIRTABLE_SCREENSHOT_FIELD} | "
+        f"table={AIRTABLE_TABLE_REF} | field={AIRTABLE_SCREENSHOT_FIELD} | "
         f"limit={BACKFILL_LIMIT} | dry_run={BACKFILL_DRY_RUN}"
     )
     print(f"Snapshot endpoint: {snapshot_endpoint()}")
