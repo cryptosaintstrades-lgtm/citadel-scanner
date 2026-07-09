@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """
-Citadel Auto Result Tracker v70.2
+Citadel Auto Result Tracker v70.3
 
 Standalone Railway worker for checking active Airtable scanner rows and marking
 whether target or invalidation was reached. Safe by default: dry-run is enabled
 unless TRACKER_DRY_RUN=false is set.
+
+v70.3 adds strict target parsing so TP1/TP2 labels are not misread as
+actual target prices.
 """
 
 from __future__ import annotations
@@ -22,7 +25,7 @@ from urllib.parse import quote
 import requests
 
 
-VERSION = "v70.2-auto-result-tracker-blofin-klines"
+VERSION = "v70.3-auto-result-tracker-strict-target-parser"
 AIRTABLE_API = "https://api.airtable.com/v0"
 BLOFIN_CANDLES_URL = "https://openapi.blofin.com/api/v1/market/candles"
 BINANCE_FAPI = "https://fapi.binance.com/fapi/v1"
@@ -245,6 +248,97 @@ def parse_price_list(value: Any) -> List[Decimal]:
     return prices
 
 
+def parse_target_prices(value: Any) -> List[Decimal]:
+    """Parse target prices without treating the label number in TP1/TP2 as price.
+
+    Examples handled:
+      TP1: 0.359874 | TP2: 0.38974
+      Target 1 = 95.3396, Target 2 = 100.5394
+      Take Profit 1 - 0.0557
+    """
+    text = as_text(value)
+    if not text:
+        return []
+
+    labeled: List[Decimal] = []
+    label_pattern = re.compile(
+        r"\b(?:tp|t|target|take\s*profit|take-profit|profit\s*target)"
+        r"\s*(?:one|two|1|2)?"
+        r"\s*(?:[:=\-–—]|at|is|to)?"
+        r"\s*\$?"
+        r"([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)",
+        flags=re.IGNORECASE,
+    )
+    for match in label_pattern.findall(text):
+        try:
+            labeled.append(Decimal(match.replace(",", "")))
+        except InvalidOperation:
+            continue
+
+    if labeled:
+        return dedupe_prices(labeled)
+
+    # Generic fallback for fields that contain only prices. Before parsing, strip
+    # TP1/TP2/Target 1 label tokens so their label numbers cannot become prices.
+    scrubbed = re.sub(
+        r"\b(?:tp|t)\s*[12]\b|\btarget\s*(?:one|two|1|2)\b|\btake\s*profit\s*[12]\b",
+        " ",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return parse_price_list(scrubbed)
+
+
+def max_target_rr() -> Decimal:
+    raw = os.getenv("TRACKER_MAX_TARGET_RR", "20")
+    try:
+        value = Decimal(str(raw))
+        return value if value > 0 else Decimal("20")
+    except InvalidOperation:
+        return Decimal("20")
+
+
+def filter_plausible_targets(
+    values: Iterable[Decimal],
+    direction: Optional[str],
+    entry: Optional[Decimal],
+    stop: Optional[Decimal] = None,
+) -> Tuple[List[Decimal], List[Decimal]]:
+    """Keep only directionally-valid targets with a sane RR profile.
+
+    This prevents TP1/TP2 label numbers like 1 or 2 from being treated as
+    targets on sub-dollar assets while still allowing a real $1 target when the
+    entry/risk profile makes it plausible.
+    """
+    accepted: List[Decimal] = []
+    rejected: List[Decimal] = []
+    limit_rr = max_target_rr()
+    risk: Optional[Decimal] = None
+    if entry is not None and stop is not None:
+        risk = abs(entry - stop)
+        if risk == 0:
+            risk = None
+
+    for price in values:
+        if price <= 0:
+            rejected.append(price)
+            continue
+        if direction == "long" and entry is not None and price <= entry:
+            rejected.append(price)
+            continue
+        if direction == "short" and entry is not None and price >= entry:
+            rejected.append(price)
+            continue
+        if risk is not None and entry is not None:
+            rr = abs(price - entry) / risk
+            if rr > limit_rr:
+                rejected.append(price)
+                continue
+        accepted.append(price)
+
+    return dedupe_prices(accepted), dedupe_prices(rejected)
+
+
 def parse_direction(value: Any) -> Optional[str]:
     text = as_text(value).lower()
     if "short" in text or "bear" in text or "sell" in text:
@@ -277,34 +371,19 @@ def text_scan_pool(fields: Dict[str, Any]) -> str:
     return "\n".join(chunks)
 
 
-def parse_targets_from_text(fields: Dict[str, Any], direction: Optional[str], entry: Optional[Decimal]) -> List[Decimal]:
+def parse_targets_from_text(
+    fields: Dict[str, Any],
+    direction: Optional[str],
+    entry: Optional[Decimal],
+    stop: Optional[Decimal] = None,
+) -> Tuple[List[Decimal], List[Decimal]]:
     text = text_scan_pool(fields)
     if not text:
-        return []
+        return [], []
 
-    labeled: List[Decimal] = []
-    patterns = [
-        r"(?:target|tp|t)\s*1[^0-9$-]*\$?\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)",
-        r"(?:target|tp|t)\s*2[^0-9$-]*\$?\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)",
-        r"(?:targets?|take profits?|tps?)[^0-9$-]*\$?\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)",
-    ]
-    for pattern in patterns:
-        for match in re.findall(pattern, text, flags=re.IGNORECASE):
-            try:
-                labeled.append(Decimal(match.replace(",", "")))
-            except InvalidOperation:
-                pass
-
-    if labeled:
-        return dedupe_prices(labeled)
-
-    candidates = parse_price_list(text)
-    if direction and entry and candidates:
-        if direction == "long":
-            candidates = [p for p in candidates if p > entry]
-        else:
-            candidates = [p for p in candidates if p < entry]
-    return dedupe_prices(candidates[:2])
+    candidates = parse_target_prices(text)
+    accepted, rejected = filter_plausible_targets(candidates, direction, entry, stop)
+    return accepted[:2], rejected
 
 
 def dedupe_prices(values: Iterable[Decimal]) -> List[Decimal]:
@@ -319,36 +398,55 @@ def dedupe_prices(values: Iterable[Decimal]) -> List[Decimal]:
     return out
 
 
-def resolve_targets(fields: Dict[str, Any], direction: Optional[str], entry: Optional[Decimal]) -> Tuple[List[Decimal], List[str]]:
+def resolve_targets(
+    fields: Dict[str, Any],
+    direction: Optional[str],
+    entry: Optional[Decimal],
+    stop: Optional[Decimal] = None,
+) -> Tuple[List[Decimal], List[str], List[Decimal]]:
     found_from: List[str] = []
     targets: List[Decimal] = []
+    rejected_all: List[Decimal] = []
 
     for logical in ("target1", "target2"):
         raw, field_name = get_field(fields, logical)
-        price = parse_decimal(raw)
-        if price is not None:
-            targets.append(price)
+        prices = parse_target_prices(raw)
+        if not prices:
+            parsed = parse_decimal(raw)
+            prices = [parsed] if parsed is not None else []
+        accepted, rejected = filter_plausible_targets(prices[:1], direction, entry, stop)
+        if accepted:
+            targets.extend(accepted)
             found_from.append(field_name or logical)
+        rejected_all.extend(rejected)
 
-    if not targets:
+    if len(targets) < 2:
         raw, field_name = get_field(fields, "target_any")
-        prices = parse_price_list(raw)
-        if prices:
-            targets.extend(prices[:2])
-            found_from.append(field_name or "target_any")
+        prices = parse_target_prices(raw)
+        accepted, rejected = filter_plausible_targets(prices, direction, entry, stop)
+        if accepted:
+            for p in accepted:
+                if p not in targets:
+                    targets.append(p)
+            if field_name:
+                found_from.append(field_name)
+        rejected_all.extend(rejected)
 
-    if not targets:
-        text_prices = parse_targets_from_text(fields, direction, entry)
+    if len(targets) < 2:
+        text_prices, rejected = parse_targets_from_text(fields, direction, entry, stop)
         if text_prices:
-            targets.extend(text_prices[:2])
+            for p in text_prices:
+                if p not in targets:
+                    targets.append(p)
             found_from.append("parsed from trade-plan text")
+        rejected_all.extend(rejected)
 
     targets = dedupe_prices(targets)
     if direction == "long":
         targets.sort()
     elif direction == "short":
         targets.sort(reverse=True)
-    return targets, found_from
+    return targets[:2], list(dict.fromkeys(found_from)), dedupe_prices(rejected_all)
 
 
 def list_records(limit: int) -> List[Dict[str, Any]]:
@@ -541,7 +639,7 @@ def process_record(record: Dict[str, Any], dry_run: bool) -> str:
     direction = parse_direction(get_field(fields, "direction")[0])
     entry = parse_decimal(get_field(fields, "entry")[0])
     stop = parse_decimal(get_field(fields, "stop")[0])
-    targets, target_sources = resolve_targets(fields, direction, entry)
+    targets, target_sources, rejected_targets = resolve_targets(fields, direction, entry, stop)
 
     missing = []
     if not symbol:
@@ -568,14 +666,14 @@ def process_record(record: Dict[str, Any], dry_run: bool) -> str:
 
     status, result, rr = determine_result(direction, entry, stop, targets, candles)
     if status != "Closed":
-        print(f"still active {label} | {direction} entry={entry} stop={stop} targets={targets} via={target_sources}")
+        print(f"still active {label} | {direction} entry={entry} stop={stop} targets={targets} via={target_sources} rejected_targets={rejected_targets}")
         return "active"
 
     if dry_run:
-        print(f"Dry run: would close {label} | result={result} rr={round(rr, 2)} targets={targets} via={target_sources}")
+        print(f"Dry run: would close {label} | result={result} rr={round(rr, 2)} targets={targets} via={target_sources} rejected_targets={rejected_targets}")
     else:
         patch_record(record_id, status, result, rr)
-        print(f"Closed {label} | result={result} rr={round(rr, 2)} targets={targets} via={target_sources}")
+        print(f"Closed {label} | result={result} rr={round(rr, 2)} targets={targets} via={target_sources} rejected_targets={rejected_targets}")
     return "closed"
 
 
@@ -619,7 +717,8 @@ def main() -> int:
         f"dry_run={env_bool('TRACKER_DRY_RUN', True)} | "
         f"include_blank={env_bool('TRACKER_INCLUDE_BLANK_STATUS', False)} | "
         f"limit={env_int('TRACKER_LIMIT', 10)} | "
-        f"kline_source={(os.getenv('TRACKER_KLINE_SOURCE') or os.getenv('TRACKER_DATA_SOURCE') or 'blofin')}"
+        f"kline_source={(os.getenv('TRACKER_KLINE_SOURCE') or os.getenv('TRACKER_DATA_SOURCE') or 'blofin')} | "
+        f"max_target_rr={max_target_rr()}"
     )
 
     interval = env_int("TRACKER_INTERVAL_SECONDS", 300)
