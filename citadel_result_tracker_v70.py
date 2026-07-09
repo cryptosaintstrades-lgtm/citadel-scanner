@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Citadel Auto Result Tracker v70.1
+Citadel Auto Result Tracker v70.2
 
 Standalone Railway worker for checking active Airtable scanner rows and marking
 whether target or invalidation was reached. Safe by default: dry-run is enabled
@@ -22,8 +22,9 @@ from urllib.parse import quote
 import requests
 
 
-VERSION = "v70.1-auto-result-tracker-target-field-fix"
+VERSION = "v70.2-auto-result-tracker-blofin-klines"
 AIRTABLE_API = "https://api.airtable.com/v0"
+BLOFIN_CANDLES_URL = "https://openapi.blofin.com/api/v1/market/candles"
 BINANCE_FAPI = "https://fapi.binance.com/fapi/v1"
 
 
@@ -383,7 +384,67 @@ def parse_alert_time(fields: Dict[str, Any]) -> Optional[int]:
         return None
 
 
-def fetch_klines(symbol: str, start_ms: Optional[int], interval: str = "5m", limit: int = 1000) -> List[Dict[str, Decimal]]:
+def to_blofin_inst_id(symbol: str) -> str:
+    text = symbol.upper().strip().replace("/", "-").replace("_", "-")
+    if "-" in text:
+        return text
+    if text.endswith("USDT"):
+        return f"{text[:-4]}-USDT"
+    return text
+
+
+def normalize_interval_for_blofin(interval: str) -> str:
+    raw = (interval or "5m").strip()
+    aliases = {
+        "1min": "1m",
+        "3min": "3m",
+        "5min": "5m",
+        "15min": "15m",
+        "30min": "30m",
+        "60m": "1H",
+        "1h": "1H",
+        "2h": "2H",
+        "4h": "4H",
+        "1d": "1D",
+    }
+    return aliases.get(raw.lower(), raw)
+
+
+def fetch_blofin_klines(symbol: str, start_ms: Optional[int], interval: str = "5m", limit: int = 1000) -> List[Dict[str, Decimal]]:
+    inst_id = to_blofin_inst_id(symbol)
+    bar = normalize_interval_for_blofin(interval)
+    safe_limit = min(max(int(limit or 1000), 10), 1000)
+    params = {"instId": inst_id, "bar": bar, "limit": str(safe_limit)}
+    response = requests.get(BLOFIN_CANDLES_URL, params=params, timeout=30)
+    if response.status_code >= 400:
+        raise RuntimeError(f"Blofin klines failed for {inst_id}: {response.status_code} {response.text[:300]}")
+
+    payload = response.json()
+    data = payload.get("data", []) if isinstance(payload, dict) else []
+    candles: List[Dict[str, Decimal]] = []
+    for row in data:
+        if not isinstance(row, list) or len(row) < 5:
+            continue
+        try:
+            open_time = int(str(row[0]))
+            candle = {
+                "open_time": Decimal(str(open_time)),
+                "high": Decimal(str(row[2])),
+                "low": Decimal(str(row[3])),
+                "close": Decimal(str(row[4])),
+            }
+        except (InvalidOperation, ValueError, TypeError):
+            continue
+        if start_ms and open_time < int(start_ms):
+            continue
+        candles.append(candle)
+
+    candles.sort(key=lambda item: item["open_time"])
+    print(f"Blofin candles loaded for {inst_id}: {len(candles)}")
+    return candles
+
+
+def fetch_binance_klines(symbol: str, start_ms: Optional[int], interval: str = "5m", limit: int = 1000) -> List[Dict[str, Decimal]]:
     params: Dict[str, Any] = {"symbol": symbol, "interval": interval, "limit": limit}
     if start_ms:
         params["startTime"] = start_ms
@@ -401,6 +462,13 @@ def fetch_klines(symbol: str, start_ms: Optional[int], interval: str = "5m", lim
             }
         )
     return candles
+
+
+def fetch_klines(symbol: str, start_ms: Optional[int], interval: str = "5m", limit: int = 1000) -> List[Dict[str, Decimal]]:
+    source = (os.getenv("TRACKER_KLINE_SOURCE") or os.getenv("TRACKER_DATA_SOURCE") or "blofin").strip().lower()
+    if source == "binance":
+        return fetch_binance_klines(symbol, start_ms, interval, limit)
+    return fetch_blofin_klines(symbol, start_ms, interval, limit)
 
 
 def determine_result(direction: str, entry: Decimal, stop: Decimal, targets: List[Decimal], candles: List[Dict[str, Decimal]]) -> Tuple[str, str, Decimal]:
@@ -550,7 +618,8 @@ def main() -> int:
         f"table={airtable_table()} | "
         f"dry_run={env_bool('TRACKER_DRY_RUN', True)} | "
         f"include_blank={env_bool('TRACKER_INCLUDE_BLANK_STATUS', False)} | "
-        f"limit={env_int('TRACKER_LIMIT', 10)}"
+        f"limit={env_int('TRACKER_LIMIT', 10)} | "
+        f"kline_source={(os.getenv('TRACKER_KLINE_SOURCE') or os.getenv('TRACKER_DATA_SOURCE') or 'blofin')}"
     )
 
     interval = env_int("TRACKER_INTERVAL_SECONDS", 300)
