@@ -1,23 +1,26 @@
 #!/usr/bin/env python3
 """
-Citadel Auto Result Tracker v70.3
+Liquidity Citadel Auto Result Tracker v70.4
 
-Standalone Railway worker for checking active Airtable scanner rows and marking
-whether target or invalidation was reached. Safe by default: dry-run is enabled
-unless TRACKER_DRY_RUN=false is set.
+Fixes:
+- Uses Blofin klines by default.
+- Strict target parser that avoids reading the "1" in TP1 as a target.
+- Forces Result, Status, RR, Closed Time values into Airtable-safe text strings.
+- Dry-run safe by default.
 
-v70.3 adds strict target parsing so TP1/TP2 labels are not misread as
-actual target prices.
+This script is intended to run as a separate Railway service:
+python citadel_result_tracker_v70.py
 """
 
 from __future__ import annotations
 
-import datetime as dt
-import json
 import os
 import re
 import sys
 import time
+import json
+import math
+import datetime as dt
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import quote
@@ -25,7 +28,8 @@ from urllib.parse import quote
 import requests
 
 
-VERSION = "v70.3-auto-result-tracker-strict-target-parser"
+VERSION = "v70.4-auto-result-tracker-rr-text-fix"
+
 AIRTABLE_API = "https://api.airtable.com/v0"
 BLOFIN_CANDLES_URL = "https://openapi.blofin.com/api/v1/market/candles"
 BINANCE_FAPI = "https://fapi.binance.com/fapi/v1"
@@ -35,707 +39,475 @@ TRUE_VALUES = {"1", "true", "yes", "y", "on"}
 ACTIVE_STATUSES = {"", "active", "open", "tracking", "in progress", "developing", "still developing"}
 CLOSED_STATUSES = {"closed", "win", "loss", "tp1", "tp2", "stopped", "invalidated"}
 
-
 FIELD_ALIASES = {
     "symbol": [
-        "symbol",
-        "ticker",
-        "asset",
-        "pair",
-        "market",
-        "coin",
+        "Pair", "pair", "Symbol", "symbol", "Ticker", "ticker", "Asset", "asset", "Market", "market", "Coin", "coin"
     ],
     "direction": [
-        "direction",
-        "bias",
-        "side",
-        "trade direction",
-        "setup direction",
-        "signal",
-        "setup",
+        "Direction", "direction", "Bias", "bias", "Side", "side", "Trade Direction", "Setup Direction", "Signal", "signal"
     ],
     "entry": [
-        "entry",
-        "entry price",
-        "entry zone",
-        "entry_zone",
-        "entry area",
-        "entry range",
-        "entry low",
-        "trigger price",
-        "alert price",
-        "price",
+        "Entry", "entry", "Entry Zone", "entry zone", "Entry Range", "entry range", "Planned Entry", "Price Entry"
     ],
-    "stop": [
-        "invalidation",
-        "invalid",
-        "invalidated at",
-        "stop",
-        "stop loss",
-        "stop_loss",
-        "sl",
-        "risk",
-        "risk level",
+    "invalidation": [
+        "Invalidation", "invalidation", "Stop", "stop", "Stop Loss", "SL", "Invalidation Level", "Risk", "Stop Price"
     ],
-    "target1": [
-        "target 1",
-        "target1",
-        "target_1",
-        "target 1 price",
-        "target 1 level",
-        "target one",
-        "tp1",
-        "tp 1",
-        "t1",
-        "take profit 1",
-        "take-profit 1",
-        "profit target 1",
-        "first target",
+    "targets": [
+        "Targets", "targets", "Target", "target", "TP", "tp",
+        "TP1", "tp1", "TP 1", "Take Profit 1", "Target 1", "Target 1 Price", "T1",
+        "TP2", "tp2", "TP 2", "Take Profit 2", "Target 2", "Target 2 Price", "T2",
     ],
-    "target2": [
-        "target 2",
-        "target2",
-        "target_2",
-        "target 2 price",
-        "target 2 level",
-        "target two",
-        "tp2",
-        "tp 2",
-        "t2",
-        "take profit 2",
-        "take-profit 2",
-        "profit target 2",
-        "second target",
-    ],
-    "target_any": [
-        "target",
-        "targets",
-        "target price",
-        "target zone",
-        "take profit",
-        "take profits",
-        "profit target",
-        "tp",
-        "tps",
-    ],
-    "alert_time": [
-        "alert time",
-        "created time",
-        "created",
-        "time",
-        "timestamp",
-        "date",
-        "published",
-        "scan time",
-    ],
-    "status": ["status"],
+    "target1": ["TP1", "tp1", "TP 1", "Take Profit 1", "Target 1", "Target 1 Price", "T1", "Target"],
+    "target2": ["TP2", "tp2", "TP 2", "Take Profit 2", "Target 2", "Target 2 Price", "T2"],
+    "timeframe": ["Timeframe", "timeframe", "TF", "tf", "Time Frame", "Scan TF"],
+    "status": ["Status", "status"],
+    "result": ["Result", "result"],
+    "rr": ["RR", "R:R", "Risk Reward", "Risk/Reward", "R Multiple"],
+    "closed_time": ["Closed Time", "Closed At", "Close Time", "Resolved Time"],
+    "scan_time": ["Scan Time", "scan_time", "Date", "Created", "Created Time", "Alert Time", "Timestamp"],
+    "reason": ["Reason", "Reasons", "Summary", "Message", "Notes", "Setup", "Description", "Trade Plan"],
 }
 
 
-TEXT_SCAN_FIELDS = [
-    "trade plan",
-    "plan",
-    "setup thesis",
-    "summary",
-    "notes",
-    "why it triggered",
-    "targets",
-    "key levels",
-    "reason",
-    "reasons",
-    "description",
-]
-
-
 def env_bool(name: str, default: bool = False) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
+    value = os.environ.get(name)
+    if value is None:
         return default
-    return raw.strip().lower() in TRUE_VALUES
+    return str(value).strip().lower() in TRUE_VALUES
 
 
 def env_int(name: str, default: int) -> int:
-    raw = os.getenv(name)
-    if not raw:
-        return default
     try:
-        return int(raw)
-    except ValueError:
+        return int(str(os.environ.get(name, default)).strip())
+    except Exception:
         return default
 
 
 def now_iso() -> str:
-    return dt.datetime.now(dt.timezone.utc).isoformat()
+    return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
 
-def normalize_key(value: str) -> str:
-    return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+def normalize_symbol(symbol: str) -> str:
+    s = (symbol or "").strip().upper()
+    s = s.replace("/", "-").replace("_", "-").replace(" ", "")
+    if s and "-" not in s and s.endswith("USDT"):
+        s = s[:-4] + "-USDT"
+    return s
 
 
-def airtable_headers() -> Dict[str, str]:
-    token = os.getenv("AIRTABLE_TOKEN") or os.getenv("AIRTABLE_API_KEY")
-    if not token:
-        raise RuntimeError("Missing AIRTABLE_TOKEN")
-    return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-
-
-def airtable_base_id() -> str:
-    base_id = os.getenv("AIRTABLE_BASE_ID")
-    if not base_id:
-        raise RuntimeError("Missing AIRTABLE_BASE_ID")
-    return base_id
-
-
-def airtable_table() -> str:
-    return os.getenv("AIRTABLE_SCANNER_TABLE") or os.getenv("AIRTABLE_TABLE_NAME") or "Scanner"
-
-
-def airtable_url(table: Optional[str] = None) -> str:
-    table_name = table or airtable_table()
-    return f"{AIRTABLE_API}/{airtable_base_id()}/{quote(table_name, safe='')}"
-
-
-def get_field(fields: Dict[str, Any], logical_name: str) -> Tuple[Any, Optional[str]]:
-    normalized = {normalize_key(k): k for k in fields.keys()}
-    for alias in FIELD_ALIASES.get(logical_name, []):
-        key = normalized.get(normalize_key(alias))
-        if key is not None:
-            value = fields.get(key)
-            if value not in (None, ""):
-                return value, key
-    return None, None
-
-
-def as_text(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, list):
-        return " ".join(as_text(v) for v in value)
-    if isinstance(value, dict):
-        return " ".join(as_text(v) for v in value.values())
-    return str(value)
+def compact_symbol(symbol: str) -> str:
+    return normalize_symbol(symbol).replace("-", "").replace("/", "")
 
 
 def parse_decimal(value: Any) -> Optional[Decimal]:
     if value is None:
         return None
-    if isinstance(value, (int, float, Decimal)):
-        try:
-            return Decimal(str(value))
-        except InvalidOperation:
+    if isinstance(value, Decimal):
+        return value
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
             return None
-
-    text = as_text(value)
+        return Decimal(str(value))
+    text = str(value).strip()
     if not text:
         return None
-    matches = re.findall(r"-?\$?\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)", text)
-    if not matches:
+    text = text.replace(",", "")
+    text = re.sub(r"(?i)\bUSDT\b", "", text).strip()
+    # Pull first normal decimal-looking number.
+    match = re.search(r"-?\d+(?:\.\d+)?", text)
+    if not match:
         return None
     try:
-        return Decimal(matches[0].replace(",", ""))
+        return Decimal(match.group(0))
     except InvalidOperation:
         return None
 
 
-def parse_price_list(value: Any) -> List[Decimal]:
-    text = as_text(value)
-    prices: List[Decimal] = []
-    for raw in re.findall(r"-?\$?\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)", text):
-        try:
-            prices.append(Decimal(raw.replace(",", "")))
-        except InvalidOperation:
-            continue
-    return prices
-
-
-def parse_target_prices(value: Any) -> List[Decimal]:
-    """Parse target prices without treating the label number in TP1/TP2 as price.
-
-    Examples handled:
-      TP1: 0.359874 | TP2: 0.38974
-      Target 1 = 95.3396, Target 2 = 100.5394
-      Take Profit 1 - 0.0557
-    """
-    text = as_text(value)
-    if not text:
+def decimals_from_text(value: Any) -> List[Decimal]:
+    if value is None:
         return []
-
-    labeled: List[Decimal] = []
-    label_pattern = re.compile(
-        r"\b(?:tp|t|target|take\s*profit|take-profit|profit\s*target)"
-        r"\s*(?:one|two|1|2)?"
-        r"\s*(?:[:=\-–—]|at|is|to)?"
-        r"\s*\$?"
-        r"([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)",
-        flags=re.IGNORECASE,
-    )
-    for match in label_pattern.findall(text):
+    if isinstance(value, list):
+        out = []
+        for item in value:
+            out.extend(decimals_from_text(item))
+        return out
+    text = str(value)
+    # Remove target labels so TP1/TP2 do not contribute standalone 1/2.
+    text = re.sub(r"(?i)\b(?:tp|t|target|take\s*profit)\s*#?\s*[12]\b", " ", text)
+    nums = []
+    for raw in re.findall(r"-?\d+(?:\.\d+)?", text.replace(",", "")):
         try:
-            labeled.append(Decimal(match.replace(",", "")))
+            nums.append(Decimal(raw))
         except InvalidOperation:
+            pass
+    return nums
+
+
+def find_field(fields: Dict[str, Any], aliases: List[str]) -> Tuple[Optional[str], Any]:
+    lower_map = {k.lower().strip(): k for k in fields.keys()}
+    for alias in aliases:
+        key = lower_map.get(alias.lower().strip())
+        if key is not None:
+            return key, fields.get(key)
+    return None, None
+
+
+def get_value(fields: Dict[str, Any], field_group: str) -> Tuple[Optional[str], Any]:
+    return find_field(fields, FIELD_ALIASES.get(field_group, []))
+
+
+def infer_direction(fields: Dict[str, Any]) -> str:
+    _, direct = get_value(fields, "direction")
+    blob = " ".join(str(x) for x in [direct, get_value(fields, "reason")[1], get_value(fields, "symbol")[1]] if x)
+    up = blob.upper()
+    if "SHORT" in up or "SELL" in up or "BEAR" in up:
+        return "SHORT"
+    if "LONG" in up or "BUY" in up or "BULL" in up:
+        return "LONG"
+    return ""
+
+
+def target_candidates(fields: Dict[str, Any], entry: Optional[Decimal], invalidation: Optional[Decimal], direction: str, max_rr: Decimal) -> Tuple[List[Decimal], List[str], List[Decimal]]:
+    raw_values = []
+    used_fields = []
+    rejected = []
+
+    for group in ("target1", "target2", "targets", "reason"):
+        for alias in FIELD_ALIASES.get(group, []):
+            key, value = find_field(fields, [alias])
+            if key and value not in (None, ""):
+                raw_values.append(value)
+                used_fields.append(key)
+
+    nums: List[Decimal] = []
+    for v in raw_values:
+        nums.extend(decimals_from_text(v))
+
+    # Remove exact label artifacts and invalid numbers.
+    cleaned: List[Decimal] = []
+    for n in nums:
+        if n <= 0:
+            rejected.append(n)
             continue
-
-    if labeled:
-        return dedupe_prices(labeled)
-
-    # Generic fallback for fields that contain only prices. Before parsing, strip
-    # TP1/TP2/Target 1 label tokens so their label numbers cannot become prices.
-    scrubbed = re.sub(
-        r"\b(?:tp|t)\s*[12]\b|\btarget\s*(?:one|two|1|2)\b|\btake\s*profit\s*[12]\b",
-        " ",
-        text,
-        flags=re.IGNORECASE,
-    )
-    return parse_price_list(scrubbed)
-
-
-def max_target_rr() -> Decimal:
-    raw = os.getenv("TRACKER_MAX_TARGET_RR", "20")
-    try:
-        value = Decimal(str(raw))
-        return value if value > 0 else Decimal("20")
-    except InvalidOperation:
-        return Decimal("20")
-
-
-def filter_plausible_targets(
-    values: Iterable[Decimal],
-    direction: Optional[str],
-    entry: Optional[Decimal],
-    stop: Optional[Decimal] = None,
-) -> Tuple[List[Decimal], List[Decimal]]:
-    """Keep only directionally-valid targets with a sane RR profile.
-
-    This prevents TP1/TP2 label numbers like 1 or 2 from being treated as
-    targets on sub-dollar assets while still allowing a real $1 target when the
-    entry/risk profile makes it plausible.
-    """
-    accepted: List[Decimal] = []
-    rejected: List[Decimal] = []
-    limit_rr = max_target_rr()
-    risk: Optional[Decimal] = None
-    if entry is not None and stop is not None:
-        risk = abs(entry - stop)
-        if risk == 0:
-            risk = None
-
-    for price in values:
-        if price <= 0:
-            rejected.append(price)
+        # Reject pure target-label artifacts.
+        if n in {Decimal("1"), Decimal("2")}:
+            rejected.append(n)
             continue
-        if direction == "long" and entry is not None and price <= entry:
-            rejected.append(price)
-            continue
-        if direction == "short" and entry is not None and price >= entry:
-            rejected.append(price)
-            continue
-        if risk is not None and entry is not None:
-            rr = abs(price - entry) / risk
-            if rr > limit_rr:
-                rejected.append(price)
-                continue
-        accepted.append(price)
+        cleaned.append(n)
 
-    return dedupe_prices(accepted), dedupe_prices(rejected)
+    if entry is not None and invalidation is not None:
+        risk = abs(entry - invalidation)
+        if risk > 0:
+            bounded = []
+            for t in cleaned:
+                rr = abs(t - entry) / risk
+                # Reject impossible or wrong-direction targets.
+                if direction == "LONG" and t <= entry:
+                    rejected.append(t)
+                    continue
+                if direction == "SHORT" and t >= entry:
+                    rejected.append(t)
+                    continue
+                if rr <= 0 or rr > max_rr:
+                    rejected.append(t)
+                    continue
+                bounded.append(t)
+            cleaned = bounded
 
-
-def parse_direction(value: Any) -> Optional[str]:
-    text = as_text(value).lower()
-    if "short" in text or "bear" in text or "sell" in text:
-        return "short"
-    if "long" in text or "bull" in text or "buy" in text:
-        return "long"
-    return None
-
-
-def parse_symbol(value: Any) -> Optional[str]:
-    text = as_text(value).upper().strip()
-    if not text:
-        return None
-    text = text.replace("/", "").replace("-", "").replace("_", "")
-    text = re.sub(r"[^A-Z0-9]", "", text)
-    if text.endswith("PERP"):
-        text = text[:-4]
-    if text and not text.endswith("USDT"):
-        text += "USDT"
-    return text or None
-
-
-def text_scan_pool(fields: Dict[str, Any]) -> str:
-    chunks: List[str] = []
-    normalized = {normalize_key(k): k for k in fields.keys()}
-    for wanted in TEXT_SCAN_FIELDS:
-        key = normalized.get(normalize_key(wanted))
-        if key:
-            chunks.append(as_text(fields.get(key)))
-    return "\n".join(chunks)
-
-
-def parse_targets_from_text(
-    fields: Dict[str, Any],
-    direction: Optional[str],
-    entry: Optional[Decimal],
-    stop: Optional[Decimal] = None,
-) -> Tuple[List[Decimal], List[Decimal]]:
-    text = text_scan_pool(fields)
-    if not text:
-        return [], []
-
-    candidates = parse_target_prices(text)
-    accepted, rejected = filter_plausible_targets(candidates, direction, entry, stop)
-    return accepted[:2], rejected
-
-
-def dedupe_prices(values: Iterable[Decimal]) -> List[Decimal]:
+    # Deduplicate while preserving order.
     seen = set()
-    out: List[Decimal] = []
-    for value in values:
-        key = str(value.normalize())
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(value)
-    return out
+    out = []
+    for n in cleaned:
+        key = str(n.normalize())
+        if key not in seen:
+            seen.add(key)
+            out.append(n)
+
+    return out[:2], sorted(set(used_fields)), rejected
 
 
-def resolve_targets(
-    fields: Dict[str, Any],
-    direction: Optional[str],
-    entry: Optional[Decimal],
-    stop: Optional[Decimal] = None,
-) -> Tuple[List[Decimal], List[str], List[Decimal]]:
-    found_from: List[str] = []
-    targets: List[Decimal] = []
-    rejected_all: List[Decimal] = []
-
-    for logical in ("target1", "target2"):
-        raw, field_name = get_field(fields, logical)
-        prices = parse_target_prices(raw)
-        if not prices:
-            parsed = parse_decimal(raw)
-            prices = [parsed] if parsed is not None else []
-        accepted, rejected = filter_plausible_targets(prices[:1], direction, entry, stop)
-        if accepted:
-            targets.extend(accepted)
-            found_from.append(field_name or logical)
-        rejected_all.extend(rejected)
-
-    if len(targets) < 2:
-        raw, field_name = get_field(fields, "target_any")
-        prices = parse_target_prices(raw)
-        accepted, rejected = filter_plausible_targets(prices, direction, entry, stop)
-        if accepted:
-            for p in accepted:
-                if p not in targets:
-                    targets.append(p)
-            if field_name:
-                found_from.append(field_name)
-        rejected_all.extend(rejected)
-
-    if len(targets) < 2:
-        text_prices, rejected = parse_targets_from_text(fields, direction, entry, stop)
-        if text_prices:
-            for p in text_prices:
-                if p not in targets:
-                    targets.append(p)
-            found_from.append("parsed from trade-plan text")
-        rejected_all.extend(rejected)
-
-    targets = dedupe_prices(targets)
-    if direction == "long":
-        targets.sort()
-    elif direction == "short":
-        targets.sort(reverse=True)
-    return targets[:2], list(dict.fromkeys(found_from)), dedupe_prices(rejected_all)
+def airtable_base_url(base_id: str, table_name: str) -> str:
+    return f"{AIRTABLE_API}/{base_id}/{quote(table_name, safe='')}"
 
 
-def list_records(limit: int) -> List[Dict[str, Any]]:
+def airtable_headers(token: str) -> Dict[str, str]:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+
+
+def list_records(token: str, base_id: str, table_name: str, limit: int, include_blank: bool) -> List[Dict[str, Any]]:
+    url = airtable_base_url(base_id, table_name)
+    headers = airtable_headers(token)
+
+    # Pull a slightly larger page so filters can happen locally.
     params = {
-        "pageSize": min(max(limit * 3, 10), 100),
-        "maxRecords": min(max(limit * 3, 10), 100),
+        "pageSize": min(max(limit * 3, 20), 100),
     }
-    response = requests.get(airtable_url(), headers=airtable_headers(), params=params, timeout=30)
-    if response.status_code >= 400:
-        raise RuntimeError(f"Airtable list failed {response.status_code}: {response.text[:500]}")
-    return response.json().get("records", [])
+
+    records = []
+    offset = None
+
+    while len(records) < limit:
+        if offset:
+            params["offset"] = offset
+        resp = requests.get(url, headers=headers, params=params, timeout=25)
+        if not resp.ok:
+            raise RuntimeError(f"Airtable list failed {resp.status_code}: {resp.text}")
+        data = resp.json()
+        for rec in data.get("records", []):
+            fields = rec.get("fields", {})
+            _, status_val = get_value(fields, "status")
+            status = str(status_val or "").strip().lower()
+            _, result_val = get_value(fields, "result")
+            if result_val not in (None, ""):
+                continue
+            if status in CLOSED_STATUSES:
+                continue
+            if status in ACTIVE_STATUSES or (include_blank and not status):
+                records.append(rec)
+            if len(records) >= limit:
+                break
+        offset = data.get("offset")
+        if not offset:
+            break
+
+    return records[:limit]
 
 
-def is_candidate(fields: Dict[str, Any], include_blank: bool) -> bool:
-    raw_status, _ = get_field(fields, "status")
-    status = as_text(raw_status).strip().lower()
-    if status in CLOSED_STATUSES:
-        return False
-    if include_blank and not status:
-        return True
-    return status in ACTIVE_STATUSES
-
-
-def parse_alert_time(fields: Dict[str, Any]) -> Optional[int]:
-    raw, _ = get_field(fields, "alert_time")
-    text = as_text(raw).strip()
-    if not text:
-        return None
-    try:
-        parsed = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
-        return int(parsed.timestamp() * 1000)
-    except ValueError:
-        return None
-
-
-def to_blofin_inst_id(symbol: str) -> str:
-    text = symbol.upper().strip().replace("/", "-").replace("_", "-")
-    if "-" in text:
-        return text
-    if text.endswith("USDT"):
-        return f"{text[:-4]}-USDT"
-    return text
-
-
-def normalize_interval_for_blofin(interval: str) -> str:
-    raw = (interval or "5m").strip()
-    aliases = {
-        "1min": "1m",
-        "3min": "3m",
-        "5min": "5m",
-        "15min": "15m",
-        "30min": "30m",
-        "60m": "1H",
-        "1h": "1H",
-        "2h": "2H",
-        "4h": "4H",
-        "1d": "1D",
+def blofin_interval(tf: str) -> str:
+    text = str(tf or "5m").strip().lower().replace(" ", "")
+    mapping = {
+        "1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m", "30m": "30m",
+        "1h": "1H", "60m": "1H", "4h": "4H", "1d": "1D", "daily": "1D"
     }
-    return aliases.get(raw.lower(), raw)
+    if "/" in text:
+        text = text.split("/")[0].strip()
+    return mapping.get(text, "5m")
 
 
-def fetch_blofin_klines(symbol: str, start_ms: Optional[int], interval: str = "5m", limit: int = 1000) -> List[Dict[str, Decimal]]:
-    inst_id = to_blofin_inst_id(symbol)
-    bar = normalize_interval_for_blofin(interval)
-    safe_limit = min(max(int(limit or 1000), 10), 1000)
-    params = {"instId": inst_id, "bar": bar, "limit": str(safe_limit)}
-    response = requests.get(BLOFIN_CANDLES_URL, params=params, timeout=30)
-    if response.status_code >= 400:
-        raise RuntimeError(f"Blofin klines failed for {inst_id}: {response.status_code} {response.text[:300]}")
-
-    payload = response.json()
-    data = payload.get("data", []) if isinstance(payload, dict) else []
-    candles: List[Dict[str, Decimal]] = []
-    for row in data:
+def get_blofin_candles(symbol: str, tf: str, limit: int = 1000) -> List[Dict[str, Decimal]]:
+    inst_id = normalize_symbol(symbol)
+    params = {
+        "instId": inst_id,
+        "bar": blofin_interval(tf),
+        "limit": min(max(int(limit), 10), 1000),
+    }
+    resp = requests.get(BLOFIN_CANDLES_URL, params=params, timeout=25)
+    if not resp.ok:
+        raise RuntimeError(f"Blofin candles failed for {inst_id}: {resp.status_code} {resp.text}")
+    data = resp.json()
+    raw = data.get("data", [])
+    candles = []
+    for row in raw:
+        # Blofin returns arrays like [ts, open, high, low, close, vol, ...]
         if not isinstance(row, list) or len(row) < 5:
             continue
         try:
-            open_time = int(str(row[0]))
-            candle = {
-                "open_time": Decimal(str(open_time)),
+            candles.append({
+                "ts": int(row[0]),
+                "open": Decimal(str(row[1])),
                 "high": Decimal(str(row[2])),
                 "low": Decimal(str(row[3])),
                 "close": Decimal(str(row[4])),
-            }
-        except (InvalidOperation, ValueError, TypeError):
+            })
+        except Exception:
             continue
-        if start_ms and open_time < int(start_ms):
-            continue
-        candles.append(candle)
-
-    candles.sort(key=lambda item: item["open_time"])
-    print(f"Blofin candles loaded for {inst_id}: {len(candles)}")
+    candles.sort(key=lambda c: c["ts"])
     return candles
 
 
-def fetch_binance_klines(symbol: str, start_ms: Optional[int], interval: str = "5m", limit: int = 1000) -> List[Dict[str, Decimal]]:
-    params: Dict[str, Any] = {"symbol": symbol, "interval": interval, "limit": limit}
-    if start_ms:
-        params["startTime"] = start_ms
-    response = requests.get(f"{BINANCE_FAPI}/klines", params=params, timeout=30)
-    if response.status_code >= 400:
-        raise RuntimeError(f"Binance klines failed for {symbol}: {response.status_code} {response.text[:300]}")
-    candles = []
-    for row in response.json():
-        candles.append(
-            {
-                "open_time": Decimal(str(row[0])),
-                "high": Decimal(str(row[2])),
-                "low": Decimal(str(row[3])),
-                "close": Decimal(str(row[4])),
-            }
-        )
-    return candles
+def evaluate_trade(symbol: str, direction: str, entry: Decimal, invalidation: Decimal, targets: List[Decimal], candles: List[Dict[str, Decimal]]) -> Tuple[str, Decimal, str]:
+    if not targets:
+        return "Active", Decimal("0"), "No target available"
 
-
-def fetch_klines(symbol: str, start_ms: Optional[int], interval: str = "5m", limit: int = 1000) -> List[Dict[str, Decimal]]:
-    source = (os.getenv("TRACKER_KLINE_SOURCE") or os.getenv("TRACKER_DATA_SOURCE") or "blofin").strip().lower()
-    if source == "binance":
-        return fetch_binance_klines(symbol, start_ms, interval, limit)
-    return fetch_blofin_klines(symbol, start_ms, interval, limit)
-
-
-def determine_result(direction: str, entry: Decimal, stop: Decimal, targets: List[Decimal], candles: List[Dict[str, Decimal]]) -> Tuple[str, str, Decimal]:
     target1 = targets[0]
     target2 = targets[1] if len(targets) > 1 else None
-    risk = abs(entry - stop)
-    if risk == 0:
-        return "Skipped", "Invalid Risk", Decimal("0")
+    risk = abs(entry - invalidation)
+    if risk <= 0:
+        return "Active", Decimal("0"), "Invalid risk"
 
-    best_result = "Still Active"
-    best_status = "Active"
-    best_rr = Decimal("0")
+    direction = direction.upper()
 
-    for candle in candles:
-        high = candle["high"]
-        low = candle["low"]
-        if direction == "long":
-            stop_hit = low <= stop
-            tp2_hit = target2 is not None and high >= target2
-            tp1_hit = high >= target1
+    for c in candles:
+        high, low = c["high"], c["low"]
+        if direction == "LONG":
+            stopped = low <= invalidation
+            hit_t2 = target2 is not None and high >= target2
+            hit_t1 = high >= target1
         else:
-            stop_hit = high >= stop
-            tp2_hit = target2 is not None and low <= target2
-            tp1_hit = low <= target1
+            stopped = high >= invalidation
+            hit_t2 = target2 is not None and low <= target2
+            hit_t1 = low <= target1
 
-        if stop_hit and (tp1_hit or tp2_hit):
-            return "Closed", "Ambiguous - Stop and Target Same Candle", Decimal("-1")
-        if stop_hit:
-            return "Closed", "Loss", Decimal("-1")
-        if tp2_hit and target2 is not None:
+        # Conservative handling if stop and target occur on same candle.
+        if stopped and (hit_t1 or hit_t2):
+            return "Loss", Decimal("-1"), "Ambiguous: stop and target same candle"
+
+        if stopped:
+            return "Loss", Decimal("-1"), "Invalidation hit"
+
+        if hit_t2:
             rr = abs(target2 - entry) / risk
-            return "Closed", "TP2", rr
-        if tp1_hit:
+            return "TP2", rr, "Target 2 hit"
+
+        if hit_t1:
             rr = abs(target1 - entry) / risk
-            best_status = "Closed"
-            best_result = "TP1"
-            best_rr = rr
-            return best_status, best_result, best_rr
+            return "TP1", rr, "Target 1 hit"
 
-    return best_status, best_result, best_rr
+    return "Active", Decimal("0"), "Still active"
 
 
-def patch_record(record_id: str, status: str, result: str, rr: Decimal) -> None:
+def fmt_rr(rr: Decimal) -> str:
+    try:
+        q = rr.quantize(Decimal("0.01"))
+    except Exception:
+        q = Decimal("0.00")
+    return f"{q}R"
+
+
+def airtable_safe_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, Decimal):
+        return str(value)
+    return str(value)
+
+
+def update_record(token: str, base_id: str, table_name: str, rec_id: str, status: str, result: str, rr: Decimal, reason: str, dry_run: bool) -> Tuple[bool, str]:
     fields = {
-        os.getenv("TRACKER_STATUS_FIELD", "Status"): status,
-        os.getenv("TRACKER_RESULT_FIELD", "Result"): result,
-        os.getenv("TRACKER_RR_FIELD", "RR"): float(round(rr, 2)),
-        os.getenv("TRACKER_CLOSED_TIME_FIELD", "Closed Time"): now_iso(),
+        "Status": airtable_safe_text("Closed" if result in {"TP1", "TP2", "Loss"} else status),
+        "Result": airtable_safe_text(result),
+        "RR": airtable_safe_text(fmt_rr(rr)),
+        "Closed Time": airtable_safe_text(now_iso()),
     }
-    response = requests.patch(
-        f"{airtable_url()}/{record_id}",
-        headers=airtable_headers(),
-        data=json.dumps({"fields": fields}),
-        timeout=30,
-    )
-    if response.status_code >= 400:
-        raise RuntimeError(f"Airtable update failed {response.status_code}: {response.text[:500]}")
 
-
-def field_names(fields: Dict[str, Any]) -> str:
-    names = list(fields.keys())
-    return ", ".join(names[:30]) + (" ..." if len(names) > 30 else "")
-
-
-def process_record(record: Dict[str, Any], dry_run: bool) -> str:
-    record_id = record["id"]
-    fields = record.get("fields", {})
-
-    symbol = parse_symbol(get_field(fields, "symbol")[0])
-    direction = parse_direction(get_field(fields, "direction")[0])
-    entry = parse_decimal(get_field(fields, "entry")[0])
-    stop = parse_decimal(get_field(fields, "stop")[0])
-    targets, target_sources, rejected_targets = resolve_targets(fields, direction, entry, stop)
-
-    missing = []
-    if not symbol:
-        missing.append("symbol")
-    if not direction:
-        missing.append("direction")
-    if entry is None:
-        missing.append("entry")
-    if stop is None:
-        missing.append("invalidation/stop")
-    if not targets:
-        missing.append("targets")
-
-    label = as_text(get_field(fields, "symbol")[0]) or record_id
-    if missing:
-        print(f"skipped {label}: missing {', '.join(missing)} | fields seen: {field_names(fields)}")
-        return "skipped"
-
-    start_ms = parse_alert_time(fields)
-    candles = fetch_klines(symbol, start_ms)
-    if not candles:
-        print(f"skipped {label}: no candles returned for {symbol}")
-        return "skipped"
-
-    status, result, rr = determine_result(direction, entry, stop, targets, candles)
-    if status != "Closed":
-        print(f"still active {label} | {direction} entry={entry} stop={stop} targets={targets} via={target_sources} rejected_targets={rejected_targets}")
-        return "active"
-
+    # Optional Notes field if it exists is not guaranteed. Do not write it by default.
     if dry_run:
-        print(f"Dry run: would close {label} | result={result} rr={round(rr, 2)} targets={targets} via={target_sources} rejected_targets={rejected_targets}")
-    else:
-        patch_record(record_id, status, result, rr)
-        print(f"Closed {label} | result={result} rr={round(rr, 2)} targets={targets} via={target_sources} rejected_targets={rejected_targets}")
-    return "closed"
+        return True, f"Dry run: would update {rec_id} fields={fields}"
+
+    url = f"{airtable_base_url(base_id, table_name)}/{rec_id}"
+    payload = {"fields": fields, "typecast": True}
+    resp = requests.patch(url, headers=airtable_headers(token), json=payload, timeout=25)
+    if not resp.ok:
+        # Fallback: if Closed Time does not exist, try without it.
+        if "Closed Time" in fields:
+            fields2 = dict(fields)
+            fields2.pop("Closed Time", None)
+            resp2 = requests.patch(url, headers=airtable_headers(token), json={"fields": fields2, "typecast": True}, timeout=25)
+            if resp2.ok:
+                return True, f"Updated Airtable {rec_id} without Closed Time result={result} rr={fields2['RR']}"
+        return False, f"Airtable update failed {resp.status_code}: {resp.text} payload={json.dumps(payload)}"
+    return True, f"Updated Airtable {rec_id} result={result} rr={fields['RR']}"
 
 
 def run_once() -> None:
+    token = os.environ.get("AIRTABLE_TOKEN", "").strip()
+    base_id = os.environ.get("AIRTABLE_BASE_ID", "").strip()
+    table_name = (
+        os.environ.get("AIRTABLE_SCANNER_TABLE")
+        or os.environ.get("AIRTABLE_TABLE_NAME")
+        or "Scanner"
+    ).strip()
+
     dry_run = env_bool("TRACKER_DRY_RUN", True)
     include_blank = env_bool("TRACKER_INCLUDE_BLANK_STATUS", False)
     limit = env_int("TRACKER_LIMIT", 10)
-
-    records = list_records(limit)
-    candidates = [r for r in records if is_candidate(r.get("fields", {}), include_blank)][:limit]
-    print(f"Tracker scan: {len(candidates)} candidate active rows.")
-
-    closed = 0
-    active = 0
-    skipped = 0
-    for idx, record in enumerate(candidates, start=1):
-        try:
-            result = process_record(record, dry_run)
-        except Exception as exc:
-            print(f"{idx}/{len(candidates)} failed {record.get('id')}: {exc}")
-            skipped += 1
-            continue
-        if result == "closed":
-            closed += 1
-        elif result == "active":
-            active += 1
-        else:
-            skipped += 1
-
-    print(
-        f"Tracker complete | closed_candidates={closed} | "
-        f"still_active={active} | skipped_or_failed={skipped} | dry_run={dry_run}"
-    )
-
-
-def main() -> int:
-    print(f"BOOT CHECK: {VERSION}")
-    print(
-        "Tracker config | "
-        f"table={airtable_table()} | "
-        f"dry_run={env_bool('TRACKER_DRY_RUN', True)} | "
-        f"include_blank={env_bool('TRACKER_INCLUDE_BLANK_STATUS', False)} | "
-        f"limit={env_int('TRACKER_LIMIT', 10)} | "
-        f"kline_source={(os.getenv('TRACKER_KLINE_SOURCE') or os.getenv('TRACKER_DATA_SOURCE') or 'blofin')} | "
-        f"max_target_rr={max_target_rr()}"
-    )
-
     interval = env_int("TRACKER_INTERVAL_SECONDS", 300)
-    run_forever = env_bool("TRACKER_RUN_FOREVER", True)
+    kline_source = os.environ.get("TRACKER_KLINE_SOURCE", "blofin").strip().lower()
+    max_target_rr = Decimal(str(os.environ.get("TRACKER_MAX_TARGET_RR", "20")))
+
+    if not token or not base_id:
+        raise RuntimeError("AIRTABLE_TOKEN and AIRTABLE_BASE_ID are required.")
+
+    print(f"BOOT CHECK: {VERSION}", flush=True)
+    print(
+        f"Tracker config | table={table_name} | dry_run={dry_run} | include_blank={include_blank} | "
+        f"limit={limit} | kline_source={kline_source} | max_target_rr={max_target_rr}",
+        flush=True,
+    )
+
+    records = list_records(token, base_id, table_name, limit, include_blank)
+    print(f"Tracker scan: {len(records)} candidate active rows.", flush=True)
+
+    closed_count = 0
+    still_active = 0
+    failed = 0
+
+    for idx, rec in enumerate(records, 1):
+        rec_id = rec.get("id", "")
+        fields = rec.get("fields", {})
+
+        _, symbol_val = get_value(fields, "symbol")
+        symbol = normalize_symbol(str(symbol_val or ""))
+        direction = infer_direction(fields)
+
+        _, entry_val = get_value(fields, "entry")
+        entry = parse_decimal(entry_val)
+
+        _, inval_val = get_value(fields, "invalidation")
+        invalidation = parse_decimal(inval_val)
+
+        _, tf_val = get_value(fields, "timeframe")
+        tf = str(tf_val or "5m")
+
+        if not symbol or not direction or entry is None or invalidation is None:
+            print(f"{idx}/{len(records)} skipped {rec_id}: missing symbol/direction/entry/invalidation | symbol={symbol} direction={direction} entry={entry} invalidation={invalidation}", flush=True)
+            failed += 1
+            continue
+
+        targets, target_fields, rejected = target_candidates(fields, entry, invalidation, direction, max_target_rr)
+        if not targets:
+            print(f"{idx}/{len(records)} skipped {symbol} {rec_id}: missing usable targets | target_fields={target_fields} rejected_targets={rejected} available_fields={list(fields.keys())}", flush=True)
+            failed += 1
+            continue
+
+        try:
+            candles = get_blofin_candles(symbol, tf, limit=1000)
+            print(f"Blofin candles loaded for {symbol}: {len(candles)}", flush=True)
+        except Exception as exc:
+            print(f"{idx}/{len(records)} failed {symbol} {rec_id}: {exc}", flush=True)
+            failed += 1
+            continue
+
+        if not candles:
+            print(f"{idx}/{len(records)} skipped {symbol} {rec_id}: no candles", flush=True)
+            failed += 1
+            continue
+
+        result, rr, reason = evaluate_trade(symbol, direction, entry, invalidation, targets, candles)
+        if result == "Active":
+            print(f"{idx}/{len(records)} still active {symbol} {rec_id}: targets={targets} reason={reason}", flush=True)
+            still_active += 1
+            continue
+
+        ok, msg = update_record(token, base_id, table_name, rec_id, "Closed", result, rr, reason, dry_run)
+        print(f"{idx}/{len(records)} {'closed' if ok else 'failed'} {symbol} {rec_id}: {msg} targets={targets}", flush=True)
+        if ok:
+            closed_count += 1
+        else:
+            failed += 1
+
+    print(
+        f"Tracker complete | closed_candidates={closed_count} | still_active={still_active} | skipped_or_failed={failed} | dry_run={dry_run}",
+        flush=True,
+    )
+
+
+def main() -> None:
+    run_once_flag = env_bool("TRACKER_RUN_ONCE", False)
+    interval = env_int("TRACKER_INTERVAL_SECONDS", 300)
+
     while True:
-        run_once()
-        if not run_forever:
+        try:
+            run_once()
+        except Exception as exc:
+            print(f"Tracker error: {exc}", flush=True)
+        if run_once_flag:
             break
         time.sleep(max(interval, 60))
-    return 0
 
 
 if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except KeyboardInterrupt:
-        raise
-    except Exception as exc:
-        print(f"Fatal tracker error: {exc}", file=sys.stderr)
-        raise
+    main()
